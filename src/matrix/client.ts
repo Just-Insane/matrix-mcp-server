@@ -416,6 +416,35 @@ async function createMatrixClientUncached(
           }
 
           if (hasUserProvidedRecoveryKey) {
+            let crossSigningBootstrapError: string | undefined;
+            let crossSignDeviceError: string | undefined;
+            const myDeviceId = client.getDeviceId();
+            try {
+              console.error("[E2EE] Restoring cross-signing keys from secret storage");
+              await crypto.bootstrapCrossSigning({});
+            } catch (e: any) {
+              crossSigningBootstrapError = e.message;
+              console.warn("[E2EE] Cross-signing restore failed:", e.message);
+            }
+
+            if (myDeviceId) {
+              try {
+                const devStatus = await crypto.getDeviceVerificationStatus(userId, myDeviceId);
+                const crossSigningStatus = await crypto.getCrossSigningStatus();
+                const hasCrossSigningPrivateKeys =
+                  crossSigningStatus.privateKeysCachedLocally.masterKey &&
+                  crossSigningStatus.privateKeysCachedLocally.selfSigningKey &&
+                  crossSigningStatus.privateKeysCachedLocally.userSigningKey;
+                if (devStatus && !devStatus.crossSigningVerified && hasCrossSigningPrivateKeys) {
+                  console.error("[E2EE] Device not cross-signed after restore, signing now");
+                  await crypto.crossSignDevice(myDeviceId);
+                }
+              } catch (e: any) {
+                crossSignDeviceError = e.message;
+                console.warn("[E2EE] Cross-signing current device failed:", e.message);
+              }
+            }
+
             let keyBackupRestoreResult: any = null;
             let keyBackupRestoreError: string | undefined;
             try {
@@ -442,8 +471,10 @@ async function createMatrixClientUncached(
               deviceId: myDiagDeviceId,
               recoveryKeySource,
               recoveryKeySourceName,
-              skippedCrossSigningBootstrap: true,
               deviceVerificationStatus: diagDevStatus,
+              crossSigningStatus: await crypto.getCrossSigningStatus(),
+              crossSigningBootstrapError,
+              crossSignDeviceError,
               keyBackupRestoreResult,
               keyBackupRestoreError,
             }, null, 2));
