@@ -3,7 +3,7 @@ import { MatrixClient, ClientEvent } from "matrix-js-sdk";
 import https from "https";
 import fetch from "node-fetch";
 import path from "path";
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from "fs";
+import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, unlinkSync } from "fs";
 import { randomBytes } from "crypto";
 import { exchangeToken, TokenExchangeConfig } from "../auth/tokenExchange.js";
 import { getCachedClient, cacheClient, removeCachedClient } from "./clientCache.js";
@@ -135,6 +135,20 @@ function getClientCreationKey(userId: string, homeserverUrl: string): string {
   return `${userId}:${homeserverUrl}`;
 }
 
+function getCryptoDatabasePrefix(userId: string): string {
+  return userId.replace(/[^a-zA-Z0-9_]/g, "_").replace(/^_+/, "");
+}
+
+function resetCryptoStoreForUser(userId: string): void {
+  const cryptoDbPrefix = getCryptoDatabasePrefix(userId);
+  for (const fileName of readdirSync(DATA_DIR)) {
+    if (fileName.startsWith(`${cryptoDbPrefix}_`) || fileName.startsWith(`${cryptoDbPrefix}-`)) {
+      unlinkSync(path.join(DATA_DIR, fileName));
+      console.error(`[E2EE] Removed stale crypto store file ${fileName}`);
+    }
+  }
+}
+
 /**
  * Creates and initializes a Matrix client instance, using cache when possible
  *
@@ -248,10 +262,12 @@ async function createMatrixClientUncached(
   if (matrixPassword && !enableOAuth) {
     // Try to reuse a previous password-login session (same device, no device accumulation)
     let loginState: { userId: string; deviceId: string; accessToken: string } | null = null;
+    let previousLoginDeviceId: string | undefined;
     try {
       const saved = JSON.parse(readFileSync(loginStateFile, "utf-8"));
       if (saved.userId === userId && saved.deviceId && saved.accessToken) {
         loginState = saved;
+        previousLoginDeviceId = saved.deviceId;
       }
     } catch { /* No saved state */ }
 
@@ -292,6 +308,10 @@ async function createMatrixClientUncached(
         if (loginData.access_token && loginData.device_id) {
           deviceId = loginData.device_id;
           effectiveAccessToken = loginData.access_token;
+          if (previousLoginDeviceId && previousLoginDeviceId !== loginData.device_id) {
+            console.error(`[Auth] Device changed from ${previousLoginDeviceId} to ${loginData.device_id}; resetting stale crypto store`);
+            resetCryptoStoreForUser(userId);
+          }
           // Persist so we reuse this device on restart
           writeFileSync(loginStateFile, JSON.stringify({
             userId,
@@ -366,7 +386,7 @@ async function createMatrixClientUncached(
 
     // Enable E2EE with persistent SQLite-backed crypto store (always-on).
     // Use userId as crypto DB prefix so each user gets their own SQLite file.
-    const cryptoDbPrefix = userId.replace(/[^a-zA-Z0-9_]/g, "_").replace(/^_+/, "");
+    const cryptoDbPrefix = getCryptoDatabasePrefix(userId);
     await client.initRustCrypto({ useIndexedDB: true, cryptoDatabasePrefix: cryptoDbPrefix });
     console.error(`[E2EE] Crypto initialised. Device ID: ${client.getDeviceId()}`);
 
