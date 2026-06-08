@@ -330,6 +330,40 @@ export async function createMatrixClient(
             console.error("[E2EE] Generated new SSSS recovery key — saved to", recoveryKeyFile);
           }
 
+          if (hasUserProvidedRecoveryKey) {
+            let keyBackupRestoreResult: any = null;
+            let keyBackupRestoreError: string | undefined;
+            try {
+              await crypto.checkKeyBackupAndEnable();
+              keyBackupRestoreResult = await restoreKeyBackupFromSecretStorage(crypto);
+            } catch (e: any) {
+              keyBackupRestoreError = e.message;
+              console.warn("[E2EE] Key backup restore failed:", e.message);
+            }
+
+            const diagPath = path.join(DATA_DIR, "e2ee-diagnostic.json");
+            const myDiagDeviceId = client.getDeviceId();
+            let diagDevStatus: any = null;
+            if (myDiagDeviceId) {
+              try {
+                diagDevStatus = await crypto.getDeviceVerificationStatus(userId, myDiagDeviceId);
+              } catch (e: any) {
+                diagDevStatus = { error: e.message };
+              }
+            }
+            writeFileSync(diagPath, JSON.stringify({
+              timestamp: new Date().toISOString(),
+              userId,
+              deviceId: myDiagDeviceId,
+              recoveryKeySource,
+              skippedCrossSigningBootstrap: true,
+              deviceVerificationStatus: diagDevStatus,
+              keyBackupRestoreResult,
+              keyBackupRestoreError,
+            }, null, 2));
+            return;
+          }
+
           const crossSigningStatus = await crypto.getCrossSigningStatus();
           if (crossSigningStatus.privateKeysCachedLocally.masterKey) {
             // Private keys already cached locally from persistent crypto store.
