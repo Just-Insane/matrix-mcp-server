@@ -1,5 +1,6 @@
 import * as sdk from "matrix-js-sdk";
 import { MatrixClient, ClientEvent } from "matrix-js-sdk";
+import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/index.js";
 import https from "https";
 import fetch from "node-fetch";
 import path from "path";
@@ -16,6 +17,75 @@ const DATA_DIR = process.env.MATRIX_DATA_DIR ?? path.join(process.cwd(), ".data"
 mkdirSync(DATA_DIR, { recursive: true });
 runMigrations(DATA_DIR);
 installIDBAdapter(DATA_DIR);
+
+type RecoveryKeySource = "env" | "file" | "local" | "generated";
+
+interface RecoveryKeyState {
+  key?: Uint8Array;
+  source?: RecoveryKeySource;
+}
+
+function decodeRecoveryKeyMaterial(rawKey: string, source: string): Uint8Array {
+  const trimmedKey = rawKey.trim();
+  if (!trimmedKey) {
+    throw new Error(`${source} is empty`);
+  }
+
+  // The local cache stores raw 32-byte key material as hex. User-facing Matrix
+  // recovery keys use the Matrix cryptographic key representation.
+  if (/^[0-9a-fA-F]{64}$/.test(trimmedKey)) {
+    return new Uint8Array(Buffer.from(trimmedKey, "hex"));
+  }
+
+  return decodeRecoveryKey(trimmedKey);
+}
+
+function loadRecoveryKey(recoveryKeyFile: string): RecoveryKeyState {
+  const envRecoveryKey = process.env.MATRIX_RECOVERY_KEY || process.env.MATRIX_SECURITY_KEY;
+  const recoveryKeyPath = process.env.MATRIX_RECOVERY_KEY_FILE;
+
+  if (envRecoveryKey) {
+    const key = decodeRecoveryKeyMaterial(envRecoveryKey, "MATRIX_RECOVERY_KEY");
+    writeFileSync(recoveryKeyFile, Buffer.from(key).toString("hex"), { mode: 0o600 });
+    console.error("[E2EE] Using recovery key from MATRIX_RECOVERY_KEY");
+    return { key, source: "env" };
+  }
+
+  if (recoveryKeyPath) {
+    const key = decodeRecoveryKeyMaterial(readFileSync(recoveryKeyPath, "utf-8"), "MATRIX_RECOVERY_KEY_FILE");
+    writeFileSync(recoveryKeyFile, Buffer.from(key).toString("hex"), { mode: 0o600 });
+    console.error(`[E2EE] Using recovery key from ${recoveryKeyPath}`);
+    return { key, source: "file" };
+  }
+
+  if (existsSync(recoveryKeyFile)) {
+    return {
+      key: decodeRecoveryKeyMaterial(readFileSync(recoveryKeyFile, "utf-8"), recoveryKeyFile),
+      source: "local",
+    };
+  }
+
+  return {};
+}
+
+async function restoreKeyBackupFromSecretStorage(crypto: NonNullable<ReturnType<MatrixClient["getCrypto"]>>): Promise<any> {
+  await crypto.loadSessionBackupPrivateKeyFromSecretStorage();
+  console.error("[E2EE] Loaded session backup private key from secret storage");
+
+  if (process.env.MATRIX_RESTORE_KEY_BACKUP === "false") {
+    console.error("[E2EE] Skipping full key backup restore because MATRIX_RESTORE_KEY_BACKUP=false");
+    return null;
+  }
+
+  console.error("[E2EE] Restoring room keys from server key backup; this may take a while");
+  const result = await crypto.restoreKeyBackup({
+    progressCallback: (progress) => {
+      console.error("[E2EE] Key backup restore progress: %j", progress);
+    },
+  });
+  console.error("[E2EE] Key backup restore complete: %j", result);
+  return result;
+}
 
 /**
  * Configuration for Matrix client creation
@@ -186,11 +256,13 @@ export async function createMatrixClient(
     }
   }
 
-  // Load SSSS recovery key from disk — needed by getSecretStorageKey on second+ runs.
+  // Load SSSS recovery key material from env/file/local cache. This is needed
+  // by getSecretStorageKey when the SDK unlocks 4S and key backup.
   const recoveryKeyFile = path.join(DATA_DIR, "ssss-recovery-key");
-  let cachedRecoveryKey: Uint8Array | undefined = existsSync(recoveryKeyFile)
-    ? new Uint8Array(Buffer.from(readFileSync(recoveryKeyFile, "utf-8").trim(), "hex"))
-    : undefined;
+  const recoveryKeyState = loadRecoveryKey(recoveryKeyFile);
+  let cachedRecoveryKey = recoveryKeyState.key;
+  let recoveryKeySource = recoveryKeyState.source;
+  const hasUserProvidedRecoveryKey = recoveryKeySource === "env" || recoveryKeySource === "file";
 
   const client = sdk.createClient({
     baseUrl: homeserverUrl,
@@ -254,6 +326,7 @@ export async function createMatrixClient(
             recoveryKeyBytes = new Uint8Array(randomBytes(32));
             writeFileSync(recoveryKeyFile, Buffer.from(recoveryKeyBytes).toString("hex"), { mode: 0o600 });
             cachedRecoveryKey = recoveryKeyBytes;
+            recoveryKeySource = "generated";
             console.error("[E2EE] Generated new SSSS recovery key — saved to", recoveryKeyFile);
           }
 
@@ -282,6 +355,9 @@ export async function createMatrixClient(
               console.warn("[E2EE] SSSS restore failed:", e.message);
             }
             if (!restored) {
+              if (hasUserProvidedRecoveryKey) {
+                console.error("[E2EE] SSSS restore failed with user-provided recovery key; refusing to reset existing secret storage.");
+              } else {
               // SSSS restore didn't work (e.g., recovery key mismatch after migration,
               // or SSSS contains stale keys from old broken bootstrap). Delete stale SSSS
               // account data from server so bootstrapSecretStorage creates fresh without
@@ -314,6 +390,7 @@ export async function createMatrixClient(
                   });
                 },
               });
+              }
             }
           } else {
             // No cross-signing at all — safe to create new keys for this user.
@@ -360,6 +437,16 @@ export async function createMatrixClient(
           }
 
           await crypto.checkKeyBackupAndEnable();
+          let keyBackupRestoreResult: any = null;
+          let keyBackupRestoreError: string | undefined;
+          if (cachedRecoveryKey) {
+            try {
+              keyBackupRestoreResult = await restoreKeyBackupFromSecretStorage(crypto);
+            } catch (e: any) {
+              keyBackupRestoreError = e.message;
+              console.warn("[E2EE] Key backup restore failed:", e.message);
+            }
+          }
           const finalCrossSigningStatus = await crypto.getCrossSigningStatus();
           console.error("[E2EE] Phase 2 complete: cross-signing status: %j", finalCrossSigningStatus);
           // Write diagnostic file so we can check status without seeing stderr
@@ -377,8 +464,11 @@ export async function createMatrixClient(
             timestamp: new Date().toISOString(),
             userId,
             deviceId: myDiagDeviceId,
+            recoveryKeySource,
             crossSigningStatus: finalCrossSigningStatus,
             deviceVerificationStatus: diagDevStatus,
+            keyBackupRestoreResult,
+            keyBackupRestoreError,
           }, null, 2));
         } // if (crypto)
       } catch (e: any) {
