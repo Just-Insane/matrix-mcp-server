@@ -129,6 +129,12 @@ export interface MatrixClientConfig {
   syncToken?: string;
 }
 
+const pendingClientCreations = new Map<string, Promise<MatrixClient>>();
+
+function getClientCreationKey(userId: string, homeserverUrl: string): string {
+  return `${userId}:${homeserverUrl}`;
+}
+
 /**
  * Creates and initializes a Matrix client instance, using cache when possible
  *
@@ -136,6 +142,35 @@ export interface MatrixClientConfig {
  * @returns Promise<MatrixClient> - Initialized Matrix client
  */
 export async function createMatrixClient(
+  config: MatrixClientConfig
+): Promise<MatrixClient> {
+  if (!config.homeserverUrl) {
+    throw new Error("Homeserver URL is required to create a Matrix client.");
+  }
+  if (!config.userId) {
+    throw new Error("User ID is required to create a Matrix client.");
+  }
+
+  const cachedClient = getCachedClient(config.userId, config.homeserverUrl);
+  if (cachedClient) {
+    return cachedClient;
+  }
+
+  const creationKey = getClientCreationKey(config.userId, config.homeserverUrl);
+  const pendingClient = pendingClientCreations.get(creationKey);
+  if (pendingClient) {
+    console.error(`[Matrix] Reusing pending Matrix client creation for ${config.userId}`);
+    return pendingClient;
+  }
+
+  const clientPromise = createMatrixClientUncached(config).finally(() => {
+    pendingClientCreations.delete(creationKey);
+  });
+  pendingClientCreations.set(creationKey, clientPromise);
+  return clientPromise;
+}
+
+async function createMatrixClientUncached(
   config: MatrixClientConfig
 ): Promise<MatrixClient> {
   const {
@@ -600,5 +635,6 @@ export async function createMatrixClient(
  * @param homeserverUrl - Matrix homeserver URL
  */
 export function removeClientFromCache(userId: string, homeserverUrl: string): void {
+  pendingClientCreations.delete(getClientCreationKey(userId, homeserverUrl));
   removeCachedClient(userId, homeserverUrl);
 }
