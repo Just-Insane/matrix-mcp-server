@@ -1,6 +1,5 @@
 import * as sdk from "matrix-js-sdk";
 import { MatrixClient, ClientEvent } from "matrix-js-sdk";
-import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/index.js";
 import https from "https";
 import fetch from "node-fetch";
 import path from "path";
@@ -10,6 +9,7 @@ import { exchangeToken, TokenExchangeConfig } from "../auth/tokenExchange.js";
 import { getCachedClient, cacheClient, removeCachedClient } from "./clientCache.js";
 import { installIDBAdapter } from "./idb-sqlite-adapter.js";
 import { runMigrations } from "./migrations.js";
+import { decodeRecoveryKey } from "./recovery-key.js";
 
 // Install SQLite-backed IndexedDB before any crypto init.
 // Uses MATRIX_DATA_DIR env var, defaults to .data/ in cwd.
@@ -23,6 +23,7 @@ type RecoveryKeySource = "env" | "file" | "local" | "generated";
 interface RecoveryKeyState {
   key?: Uint8Array;
   source?: RecoveryKeySource;
+  sourceName?: string;
 }
 
 function decodeRecoveryKeyMaterial(rawKey: string, source: string): Uint8Array {
@@ -41,27 +42,33 @@ function decodeRecoveryKeyMaterial(rawKey: string, source: string): Uint8Array {
 }
 
 function loadRecoveryKey(recoveryKeyFile: string): RecoveryKeyState {
-  const envRecoveryKey = process.env.MATRIX_RECOVERY_KEY || process.env.MATRIX_SECURITY_KEY;
+  const envRecoveryKeyName = process.env.MATRIX_RECOVERY_KEY
+    ? "MATRIX_RECOVERY_KEY"
+    : process.env.MATRIX_SECURITY_KEY
+      ? "MATRIX_SECURITY_KEY"
+      : undefined;
+  const envRecoveryKey = envRecoveryKeyName ? process.env[envRecoveryKeyName] : undefined;
   const recoveryKeyPath = process.env.MATRIX_RECOVERY_KEY_FILE;
 
   if (envRecoveryKey) {
-    const key = decodeRecoveryKeyMaterial(envRecoveryKey, "MATRIX_RECOVERY_KEY");
+    const key = decodeRecoveryKeyMaterial(envRecoveryKey, envRecoveryKeyName!);
     writeFileSync(recoveryKeyFile, Buffer.from(key).toString("hex"), { mode: 0o600 });
-    console.error("[E2EE] Using recovery key from MATRIX_RECOVERY_KEY");
-    return { key, source: "env" };
+    console.error(`[E2EE] Using recovery key from ${envRecoveryKeyName}`);
+    return { key, source: "env", sourceName: envRecoveryKeyName };
   }
 
   if (recoveryKeyPath) {
     const key = decodeRecoveryKeyMaterial(readFileSync(recoveryKeyPath, "utf-8"), "MATRIX_RECOVERY_KEY_FILE");
     writeFileSync(recoveryKeyFile, Buffer.from(key).toString("hex"), { mode: 0o600 });
     console.error(`[E2EE] Using recovery key from ${recoveryKeyPath}`);
-    return { key, source: "file" };
+    return { key, source: "file", sourceName: "MATRIX_RECOVERY_KEY_FILE" };
   }
 
   if (existsSync(recoveryKeyFile)) {
     return {
       key: decodeRecoveryKeyMaterial(readFileSync(recoveryKeyFile, "utf-8"), recoveryKeyFile),
       source: "local",
+      sourceName: recoveryKeyFile,
     };
   }
 
@@ -78,9 +85,24 @@ async function restoreKeyBackupFromSecretStorage(crypto: NonNullable<ReturnType<
   }
 
   console.error("[E2EE] Restoring room keys from server key backup; this may take a while");
+  let lastProgressLogMs = 0;
+  let lastProgressSuccesses = -1;
   const result = await crypto.restoreKeyBackup({
     progressCallback: (progress) => {
-      console.error("[E2EE] Key backup restore progress: %j", progress);
+      const now = Date.now();
+      const successes = "successes" in progress && typeof progress.successes === "number"
+        ? progress.successes
+        : lastProgressSuccesses;
+      const shouldLog =
+        !("successes" in progress) ||
+        successes === progress.total ||
+        successes - lastProgressSuccesses >= 500 ||
+        now - lastProgressLogMs >= 5_000;
+      if (shouldLog) {
+        lastProgressLogMs = now;
+        lastProgressSuccesses = successes;
+        console.warn("[E2EE] Key backup restore progress: %j", progress);
+      }
     },
   });
   console.error("[E2EE] Key backup restore complete: %j", result);
@@ -262,6 +284,7 @@ export async function createMatrixClient(
   const recoveryKeyState = loadRecoveryKey(recoveryKeyFile);
   let cachedRecoveryKey = recoveryKeyState.key;
   let recoveryKeySource = recoveryKeyState.source;
+  const recoveryKeySourceName = recoveryKeyState.sourceName;
   const hasUserProvidedRecoveryKey = recoveryKeySource === "env" || recoveryKeySource === "file";
 
   const client = sdk.createClient({
@@ -356,6 +379,7 @@ export async function createMatrixClient(
               userId,
               deviceId: myDiagDeviceId,
               recoveryKeySource,
+              recoveryKeySourceName,
               skippedCrossSigningBootstrap: true,
               deviceVerificationStatus: diagDevStatus,
               keyBackupRestoreResult,
@@ -389,9 +413,6 @@ export async function createMatrixClient(
               console.warn("[E2EE] SSSS restore failed:", e.message);
             }
             if (!restored) {
-              if (hasUserProvidedRecoveryKey) {
-                console.error("[E2EE] SSSS restore failed with user-provided recovery key; refusing to reset existing secret storage.");
-              } else {
               // SSSS restore didn't work (e.g., recovery key mismatch after migration,
               // or SSSS contains stale keys from old broken bootstrap). Delete stale SSSS
               // account data from server so bootstrapSecretStorage creates fresh without
@@ -424,7 +445,6 @@ export async function createMatrixClient(
                   });
                 },
               });
-              }
             }
           } else {
             // No cross-signing at all — safe to create new keys for this user.
@@ -499,6 +519,7 @@ export async function createMatrixClient(
             userId,
             deviceId: myDiagDeviceId,
             recoveryKeySource,
+            recoveryKeySourceName,
             crossSigningStatus: finalCrossSigningStatus,
             deviceVerificationStatus: diagDevStatus,
             keyBackupRestoreResult,
