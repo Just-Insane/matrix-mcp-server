@@ -45,6 +45,7 @@ codex mcp add matrix-server \
   --env MATRIX_HOMESERVER_URL=https://your-homeserver.com \
   --env MATRIX_DATA_DIR=/path/to/persistent/data \
   --env MATRIX_PASSWORD=your-matrix-password \
+  --env MATRIX_RECOVERY_KEY='EsTc ...' \
   -- npx github:Vegard-/matrix-mcp-server
 ```
 
@@ -68,6 +69,38 @@ Phase 1 is always on. For Phase 2, add your Matrix account password to the env:
 ```
 
 A recovery key is auto-generated on first run and saved to `MATRIX_DATA_DIR/ssss-recovery-key`. Keep this file safe — it's needed to restore key backup access if the crypto store is lost.
+
+### Restoring existing encrypted history
+
+To decrypt messages sent before this MCP device logged in, provide your existing Matrix security/recovery key from Element:
+
+```bash
+-e MATRIX_RECOVERY_KEY='EsTc ...'
+```
+
+or store it in a file and pass the file path:
+
+```bash
+-e MATRIX_RECOVERY_KEY_FILE=/path/to/matrix-recovery-key.txt
+```
+
+`MATRIX_RECOVERY_KEY` accepts the normal Matrix recovery key format shown by Element. A raw 32-byte hex key is also accepted for compatibility with `MATRIX_DATA_DIR/ssss-recovery-key`.
+
+When a recovery key is provided, the server:
+
+- decodes it using the Matrix cryptographic key representation
+- caches the raw key at `MATRIX_DATA_DIR/ssss-recovery-key`
+- uses it to unlock server-side secret storage
+- loads the session backup private key from secret storage
+- restores room keys from server key backup
+
+By default, key backup restore runs automatically when a recovery key is available. To only cache/unlock the backup key and skip the full restore pass, set:
+
+```bash
+-e MATRIX_RESTORE_KEY_BACKUP=false
+```
+
+The full restore can take a long time on large accounts. Keep `MATRIX_RECOVERY_KEY`, `MATRIX_RECOVERY_KEY_FILE`, and `MATRIX_DATA_DIR/ssss-recovery-key` private.
 
 ### Known Limitations
 
@@ -110,6 +143,9 @@ MATRIX_USER_ID="@bot:matrix.example.com"
 MATRIX_ACCESS_TOKEN="syt_..."
 MATRIX_DATA_DIR="/var/lib/matrix-mcp/data"  # Persistent crypto store — use an absolute path
 MATRIX_PASSWORD=""                           # Optional: enables cross-signing + SSSS (Phase 2 E2EE)
+MATRIX_RECOVERY_KEY=""                       # Optional: existing Matrix/Element recovery key
+MATRIX_RECOVERY_KEY_FILE=""                  # Optional: path to existing Matrix/Element recovery key
+MATRIX_RESTORE_KEY_BACKUP=true               # Set false to skip full historical key restore
 
 # OAuth / token exchange (optional)
 ENABLE_OAUTH=false
