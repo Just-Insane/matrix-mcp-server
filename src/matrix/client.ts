@@ -87,21 +87,28 @@ async function restoreKeyBackupFromSecretStorage(crypto: NonNullable<ReturnType<
   console.error("[E2EE] Restoring room keys from server key backup; this may take a while");
   let lastProgressLogMs = 0;
   let lastProgressSuccesses = -1;
+  let lastProgressStage: unknown;
   const result = await crypto.restoreKeyBackup({
     progressCallback: (progress) => {
       const now = Date.now();
       const successes = "successes" in progress && typeof progress.successes === "number"
         ? progress.successes
         : lastProgressSuccesses;
+      const stageChanged = "stage" in progress && progress.stage !== lastProgressStage;
+      const total = "total" in progress && typeof progress.total === "number" ? progress.total : undefined;
+      const meaningfulIncrement = total
+        ? successes - lastProgressSuccesses >= Math.max(500, Math.floor(total / 10))
+        : false;
       const shouldLog =
-        !("successes" in progress) ||
-        successes === progress.total ||
-        successes - lastProgressSuccesses >= 500 ||
-        now - lastProgressLogMs >= 5_000;
+        stageChanged ||
+        (total !== undefined && successes === total) ||
+        meaningfulIncrement ||
+        now - lastProgressLogMs >= 10_000;
       if (shouldLog) {
         lastProgressLogMs = now;
         lastProgressSuccesses = successes;
-        console.warn("[E2EE] Key backup restore progress: %j", progress);
+        lastProgressStage = "stage" in progress ? progress.stage : lastProgressStage;
+        console.log("[E2EE] Key backup restore progress: %j", progress);
       }
     },
   });
