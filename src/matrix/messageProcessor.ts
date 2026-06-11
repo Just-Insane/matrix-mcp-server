@@ -120,6 +120,15 @@ export async function processMessagesByDate(
     return timestamp >= start && timestamp <= end;
   });
 
+  // Backfilled encrypted events often decrypt asynchronously after pagination.
+  // Wait for decryption on the target window before serializing message bodies.
+  await Promise.allSettled(
+    filteredEvents
+      .slice()
+      .reverse()
+      .map((event) => matrixClient.decryptEventIfNeeded(event))
+  );
+
   const messages = await Promise.all(
     filteredEvents.map((event) => processMessage(event, matrixClient))
   );
