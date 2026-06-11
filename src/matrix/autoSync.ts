@@ -130,6 +130,7 @@ export async function startAutoSync(): Promise<void> {
   // --- Catch-up scan: process events in timeline from initial sync ---
   for (const room of client.getRooms()) {
     if (room.getMyMembership() !== "join") continue;
+    queue.setRoomPaginationToken(room.roomId, room.oldState.paginationToken);
 
     const events = room.getLiveTimeline().getEvents();
     for (const event of events) {
