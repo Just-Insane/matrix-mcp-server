@@ -63,6 +63,9 @@ class MessageQueue extends EventEmitter {
     selectUnfetchedByRoom: Database.Statement;
     getSyncToken: Database.Statement;
     setSyncToken: Database.Statement;
+    getRoomPaginationToken: Database.Statement;
+    setRoomPaginationToken: Database.Statement;
+    clearRoomPaginationToken: Database.Statement;
     updateDecrypted: Database.Statement;
   };
 
@@ -146,6 +149,15 @@ class MessageQueue extends EventEmitter {
       ),
       setSyncToken: this.db.prepare(
         "INSERT OR REPLACE INTO sync_state (key, value) VALUES ('sync_token', ?)"
+      ),
+      getRoomPaginationToken: this.db.prepare(
+        "SELECT value FROM sync_state WHERE key = ?"
+      ),
+      setRoomPaginationToken: this.db.prepare(
+        "INSERT OR REPLACE INTO sync_state (key, value) VALUES (?, ?)"
+      ),
+      clearRoomPaginationToken: this.db.prepare(
+        "DELETE FROM sync_state WHERE key = ?"
       ),
       updateDecrypted: this.db.prepare(`
         UPDATE queued_items SET body = ?, decryption_failed = 0, decryption_failure_reason = NULL
@@ -281,6 +293,21 @@ class MessageQueue extends EventEmitter {
 
   setSyncToken(token: string): void {
     this.stmts.setSyncToken.run(token);
+  }
+
+  getRoomPaginationToken(roomId: string): string | null {
+    const key = `room_pagination_token:${roomId}`;
+    const row = this.stmts.getRoomPaginationToken.get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+
+  setRoomPaginationToken(roomId: string, token: string | null): void {
+    const key = `room_pagination_token:${roomId}`;
+    if (!token) {
+      this.stmts.clearRoomPaginationToken.run(key);
+      return;
+    }
+    this.stmts.setRoomPaginationToken.run(key, token);
   }
 
   replaySince(sinceMs: number, roomId?: string): QueueContents {

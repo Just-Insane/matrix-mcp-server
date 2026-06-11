@@ -1,5 +1,5 @@
 import * as sdk from "matrix-js-sdk";
-import { MatrixClient, ClientEvent } from "matrix-js-sdk";
+import { MatrixClient, ClientEvent, EventTimeline } from "matrix-js-sdk";
 import https from "https";
 import fetch from "node-fetch";
 import path from "path";
@@ -10,6 +10,7 @@ import { getCachedClient, cacheClient, removeCachedClient } from "./clientCache.
 import { installIDBAdapter } from "./idb-sqlite-adapter.js";
 import { runMigrations } from "./migrations.js";
 import { decodeRecoveryKey } from "./recovery-key.js";
+import { getMessageQueue } from "./messageQueue.js";
 
 // Install SQLite-backed IndexedDB before any crypto init.
 // Uses MATRIX_DATA_DIR env var, defaults to .data/ in cwd.
@@ -146,6 +147,20 @@ function resetCryptoStoreForUser(userId: string): void {
       unlinkSync(path.join(DATA_DIR, fileName));
       console.error(`[E2EE] Removed stale crypto store file ${fileName}`);
     }
+  }
+}
+
+function restoreRoomPaginationTokens(client: MatrixClient): void {
+  const queue = getMessageQueue();
+
+  for (const room of client.getRooms()) {
+    if (room.getMyMembership() !== "join") continue;
+    if (room.oldState.paginationToken !== null) continue;
+
+    const persistedToken = queue.getRoomPaginationToken(room.roomId);
+    if (!persistedToken) continue;
+
+    room.getLiveTimeline().setPaginationToken(persistedToken, EventTimeline.BACKWARDS);
   }
 }
 
@@ -663,6 +678,8 @@ async function createMatrixClientUncached(
     } catch (_) {
       // Presence may not be supported by all homeservers (e.g., Dendrite)
     }
+
+    restoreRoomPaginationTokens(client);
 
     // Cache the successfully created and synced client
     cacheClient(client, userId, homeserverUrl);

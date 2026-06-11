@@ -2,6 +2,7 @@ import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { createConfiguredMatrixClient, getAccessToken, getMatrixContext } from "../../utils/server-helpers.js";
 import { removeClientFromCache } from "../../matrix/client.js";
+import { getMessageQueue } from "../../matrix/messageQueue.js";
 import { shouldEvictClientCache } from "../../utils/matrix-errors.js";
 import { processMessage, processMessagesByDate, countMessagesByUser } from "../../matrix/messageProcessor.js";
 import { ToolRegistrationFunction } from "../../types/tool-types.js";
@@ -15,6 +16,7 @@ async function backfillRoomHistoryUntil(
   targetStartTs: number
 ): Promise<void> {
   let batchesLoaded = 0;
+  const queue = getMessageQueue();
 
   while (room.oldState.paginationToken !== null && batchesLoaded < MAX_SCROLLBACK_BATCHES) {
     const events = room.getLiveTimeline().getEvents();
@@ -28,6 +30,7 @@ async function backfillRoomHistoryUntil(
     await client.scrollback(room, DEFAULT_SCROLLBACK_BATCH_SIZE);
     const afterEvents = room.getLiveTimeline().getEvents();
     const afterCount = afterEvents.length;
+    queue.setRoomPaginationToken(room.roomId, room.oldState.paginationToken);
 
     // Stop if no additional events were loaded.
     if (afterCount <= beforeCount) {
@@ -122,6 +125,7 @@ export const getMessagesByDateHandler = async (
     }
 
     const startTs = new Date(startDate).getTime();
+    getMessageQueue().setRoomPaginationToken(room.roomId, room.oldState.paginationToken);
     await backfillRoomHistoryUntil(client, room, startTs);
 
     const events = room.getLiveTimeline().getEvents();
