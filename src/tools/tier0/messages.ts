@@ -6,6 +6,38 @@ import { shouldEvictClientCache } from "../../utils/matrix-errors.js";
 import { processMessage, processMessagesByDate, countMessagesByUser } from "../../matrix/messageProcessor.js";
 import { ToolRegistrationFunction } from "../../types/tool-types.js";
 
+const DEFAULT_SCROLLBACK_BATCH_SIZE = 100;
+const MAX_SCROLLBACK_BATCHES = 20;
+
+async function backfillRoomHistoryUntil(
+  client: any,
+  room: any,
+  targetStartTs: number
+): Promise<void> {
+  let batchesLoaded = 0;
+
+  while (room.oldState.paginationToken !== null && batchesLoaded < MAX_SCROLLBACK_BATCHES) {
+    const events = room.getLiveTimeline().getEvents();
+    const earliestEventTs = events.length > 0 ? Math.min(...events.map((event: any) => event.getTs())) : Number.POSITIVE_INFINITY;
+
+    if (earliestEventTs <= targetStartTs) {
+      return;
+    }
+
+    const beforeCount = events.length;
+    await client.scrollback(room, DEFAULT_SCROLLBACK_BATCH_SIZE);
+    const afterEvents = room.getLiveTimeline().getEvents();
+    const afterCount = afterEvents.length;
+
+    // Stop if no additional events were loaded.
+    if (afterCount <= beforeCount) {
+      return;
+    }
+
+    batchesLoaded += 1;
+  }
+}
+
 // Tool: Get room messages
 export const getRoomMessagesHandler = async (
   { roomId, limit }: { roomId: string; limit: number },
@@ -88,6 +120,9 @@ export const getMessagesByDateHandler = async (
         isError: true,
       };
     }
+
+    const startTs = new Date(startDate).getTime();
+    await backfillRoomHistoryUntil(client, room, startTs);
 
     const events = room.getLiveTimeline().getEvents();
     const messages = await processMessagesByDate(events, startDate, endDate, client);
