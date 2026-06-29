@@ -8,6 +8,7 @@
 import "dotenv/config";
 import { spawn, ChildProcess } from "child_process";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { logger as matrixLogger } from "matrix-js-sdk/lib/logger.js";
 import server from "./server.js";
 import { shutdownAllClients } from "./matrix/clientCache.js";
 import { startAutoSync, stopAutoSync } from "./matrix/autoSync.js";
@@ -46,8 +47,18 @@ if (!process.env.MCP_CHILD) {
 } else {
   // Inner process (MCP_CHILD=1): run the actual MCP server.
 
-  // Stdout is reserved for MCP JSON-RPC. Redirect console.log to stderr.
-  console.log = (...args: unknown[]) => console.error(...args);
+  // Stdout is reserved for MCP JSON-RPC. Redirect all console output methods to stderr.
+  // matrix-js-sdk's loglevel factory calls console[methodName] at runtime, so we must
+  // redirect debug/info/trace/log — not just log.
+  console.log   = (...args: unknown[]) => process.stderr.write(args.join(" ") + "\n");
+  console.info  = (...args: unknown[]) => process.stderr.write(args.join(" ") + "\n");
+  console.debug = (...args: unknown[]) => process.stderr.write(args.join(" ") + "\n");
+  console.trace = (...args: unknown[]) => process.stderr.write(args.join(" ") + "\n");
+
+  // Also suppress matrix-js-sdk's verbose debug/info logging at the loglevel layer.
+  // warn and error still go to stderr (console.warn/error are already on stderr).
+  // setLevel is a loglevel method not exposed in the TS interface, so cast to any.
+  (matrixLogger as any).setLevel("warn");
 
   const required = ["MATRIX_USER_ID", "MATRIX_ACCESS_TOKEN", "MATRIX_HOMESERVER_URL"] as const;
   const missing = required.filter((key) => !process.env[key]);

@@ -109,7 +109,7 @@ async function restoreKeyBackupFromSecretStorage(crypto: NonNullable<ReturnType<
         lastProgressLogMs = now;
         lastProgressSuccesses = successes;
         lastProgressStage = "stage" in progress ? progress.stage : lastProgressStage;
-        console.log("[E2EE] Key backup restore progress: %j", progress);
+        console.error("[E2EE] Key backup restore progress: %j", progress);
       }
     },
   });
