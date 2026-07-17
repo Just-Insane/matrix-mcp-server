@@ -126,6 +126,7 @@ MATRIX_USER_ID='@notification-bot:example.com'
 MATRIX_ACCESS_TOKEN='runtime-secret'
 MATRIX_HOMESERVER_URL='https://matrix.example.com'
 MATRIX_DATA_DIR='/var/lib/matrix-notifier'
+HOST='0.0.0.0' # only when the container port is published on host loopback
 ```
 
 Use a persistent `MATRIX_DATA_DIR` when the destination is encrypted. Broker
