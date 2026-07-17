@@ -8,6 +8,8 @@ A comprehensive **Model Context Protocol (MCP) server** that provides secure acc
 - 🔐 **OAuth 2.0 Authentication** with token exchange support
 - 📱 **Matrix Tools** organized by functionality tiers
 - 🔌 **Stdio & HTTP transports** — use via `npx` or as an HTTP server
+- 🔔 **Notification broker mode** — expose only a fixed-destination,
+  plain-text `send-notification` tool for a dedicated bot runtime
 - 🏠 **Multi-homeserver Support** with configurable endpoints
 - ♻️ **Hot-reload** — update the server without dropping the MCP connection
 - 🔄 **Sync token persistence** — resumes exactly where it left off after restart
@@ -109,6 +111,26 @@ The full restore can take a long time on large accounts. Keep `MATRIX_RECOVERY_K
 ## Setup: HTTP server
 
 For multi-user deployments or when you want a persistent endpoint. Requires cloning the repo and running the server yourself. Supports optional OAuth token exchange via an identity provider (e.g. Keycloak).
+
+### Dedicated notification broker
+
+Set `MATRIX_NOTIFICATION_ONLY=true` to replace the normal Matrix surface with
+one `send-notification` tool. The caller supplies only a plain-text body; the
+server takes the destination from `MATRIX_NOTIFICATION_ROOM_ID` and the bot
+identity from the normal Matrix runtime variables.
+
+```bash
+MATRIX_NOTIFICATION_ONLY=true
+MATRIX_NOTIFICATION_ROOM_ID='!fixed-room:example.com'
+MATRIX_USER_ID='@notification-bot:example.com'
+MATRIX_ACCESS_TOKEN='runtime-secret'
+MATRIX_HOMESERVER_URL='https://matrix.example.com'
+MATRIX_DATA_DIR='/var/lib/matrix-notifier'
+```
+
+Use a persistent `MATRIX_DATA_DIR` when the destination is encrypted. Broker
+mode deliberately omits Matrix reads, arbitrary destinations, direct-message
+creation, membership changes, edits, redaction, reactions, and administration.
 
 ### 1. Start the server
 

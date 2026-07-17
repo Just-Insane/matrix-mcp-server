@@ -30,10 +30,12 @@
     "jwks-rsa": "^3.2.0",
     "matrix-js-sdk": "^37.4.0",
     "node-fetch": "^3.3.2",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
+    "@types/jsonwebtoken": "^9.0.10",
     "@typescript-eslint/eslint-plugin": "^8.31.1",
     "@typescript-eslint/parser": "^8.31.1",
     "eslint": "^9.25.1",
