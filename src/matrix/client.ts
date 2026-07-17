@@ -414,6 +414,21 @@ async function createMatrixClientUncached(
       // E2EE will become available once bootstrap completes.
       (async () => {
       try {
+        // A new Rust crypto store needs the initial /sync and /keys/query to
+        // populate our public identity before private cross-signing keys can be
+        // imported from SSSS. Starting Phase 2 before sync reaches PREPARED
+        // races that identity query and leaves an otherwise recoverable device
+        // unsigned.
+        const identityDeadline = Date.now() + 30_000;
+        while (true) {
+          const syncState = client.getSyncState();
+          if (syncState === "PREPARED" || syncState === "SYNCING") break;
+          if (Date.now() >= identityDeadline) {
+            throw new Error("Matrix sync did not become ready for cross-signing restore");
+          }
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+
         const crypto = client.getCrypto();
         if (crypto) {
           // Load or generate a recovery key for SSSS.
@@ -435,6 +450,12 @@ async function createMatrixClientUncached(
             let crossSignDeviceError: string | undefined;
             const myDeviceId = client.getDeviceId();
             try {
+              // Rust crypto cannot import the private cross-signing keys until it
+              // has fetched our public identity. A brand-new device may still
+              // have the automatic /keys/query pending here, which makes
+              // bootstrapCrossSigning fail even with the correct recovery key.
+              // Force that query to complete before importing from SSSS.
+              await crypto.getUserDeviceInfo([userId], true);
               console.error("[E2EE] Restoring cross-signing keys from secret storage");
               await crypto.bootstrapCrossSigning({});
             } catch (e: any) {
