@@ -3,6 +3,7 @@ import cors from "cors";
 import express from "express";
 import https from "https";
 import fs from "fs";
+import { logger as matrixLogger } from "matrix-js-sdk/lib/logger.js";
 import {
   createOAuthMetadata,
   mcpAuthMetadataRouter,
@@ -14,6 +15,10 @@ import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middlew
 import routes from "./routes.js";
 import { verifyAccessToken } from "./auth/verifyAccessToken.js";
 import { shutdownAllClients } from "./matrix/clientCache.js";
+
+// Matrix SDK debug output can include cryptographic backup request material.
+// Keep production HTTP logs at warning/error, matching the stdio entry point.
+(matrixLogger as any).setLevel("warn");
 
 const app = express();
 
