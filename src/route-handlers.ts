@@ -1,18 +1,27 @@
 import { Request, Response } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import server from "./server.js";
+import { createServer } from "./server.js";
 
 export const handlePost = async (req: Request, res: Response) => {
+  const server = createServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+  });
+  let cleanedUp = false;
+  const cleanup = async () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    await transport.close();
+    await server.close();
+  };
+
+  res.once("close", () => {
+    void cleanup();
+  });
+
   try {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
-    res.on("close", () => {
-      transport.close();
-      server.close();
-    });
   } catch (error) {
     console.error("Error handling MCP request:", error);
     if (!res.headersSent) {
@@ -25,6 +34,7 @@ export const handlePost = async (req: Request, res: Response) => {
         id: null,
       });
     }
+    await cleanup();
   }
 };
 

@@ -8,7 +8,7 @@
 import "dotenv/config";
 import { spawn, ChildProcess } from "child_process";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import server from "./server.js";
+import { createServer } from "./server.js";
 import { shutdownAllClients } from "./matrix/clientCache.js";
 import { startAutoSync, stopAutoSync } from "./matrix/autoSync.js";
 import { closeMessageQueue } from "./matrix/messageQueue.js";
@@ -45,6 +45,7 @@ if (!process.env.MCP_CHILD) {
   });
 } else {
   // Inner process (MCP_CHILD=1): run the actual MCP server.
+  const server = createServer();
 
   // Stdout is reserved for MCP JSON-RPC. Redirect console.log to stderr.
   console.log = (...args: unknown[]) => console.error(...args);
