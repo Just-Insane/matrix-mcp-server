@@ -4,6 +4,7 @@ import { createConfiguredMatrixClient, getAccessToken, getMatrixContext } from "
 import { removeClientFromCache } from "../../matrix/client.js";
 import { shouldEvictClientCache } from "../../utils/matrix-errors.js";
 import { ToolRegistrationFunction } from "../../types/tool-types.js";
+import { NotificationCountType } from "matrix-js-sdk";
 
 // Tool: List joined rooms
 export const listJoinedRoomsHandler = async (_input: any, { requestInfo, authInfo }: any): Promise<CallToolResult> => {
@@ -30,6 +31,52 @@ export const listJoinedRoomsHandler = async (_input: any, { requestInfo, authInf
           text: `Error: Failed to list joined rooms - ${error.message}`,
         },
       ],
+      isError: true,
+    };
+  }
+};
+
+// Tool: List recently active rooms without exposing names or message bodies.
+export const listActiveRoomsHandler = async (
+  { since, limit }: { since: string; limit: number },
+  { requestInfo, authInfo }: any
+): Promise<CallToolResult> => {
+  const { matrixUserId, homeserverUrl } = getMatrixContext(requestInfo?.headers);
+  const accessToken = getAccessToken(requestInfo?.headers, authInfo?.token);
+
+  try {
+    const sinceMs = Date.parse(since);
+    if (!Number.isFinite(sinceMs)) {
+      return {
+        content: [{ type: "text", text: "Error: since must be an ISO-8601 timestamp." }],
+        isError: true,
+      };
+    }
+    const client = await createConfiguredMatrixClient(homeserverUrl, matrixUserId, accessToken);
+    const rooms = client.getRooms()
+      .filter((room) => room.getMyMembership() === "join")
+      .map((room) => ({ room, lastTs: room.getLastLiveEvent()?.getTs() || 0 }))
+      .filter(({ lastTs }) => lastTs >= sinceMs)
+      .sort((a, b) => b.lastTs - a.lastTs)
+      .slice(0, limit);
+
+    return {
+      content: rooms.map(({ room, lastTs }) => ({
+        type: "text" as const,
+        text: JSON.stringify({
+          roomId: room.roomId,
+          memberCount: room.getJoinedMemberCount(),
+          lastActivity: new Date(lastTs).toISOString(),
+          unreadCount: room.getUnreadNotificationCount() || 0,
+          mentionCount: room.getUnreadNotificationCount(NotificationCountType.Highlight) || 0,
+        }),
+      })),
+    };
+  } catch (error: any) {
+    console.error(`Failed to list active rooms: ${error.message}`);
+    if (shouldEvictClientCache(error)) removeClientFromCache(matrixUserId, homeserverUrl);
+    return {
+      content: [{ type: "text", text: `Error: Failed to list active rooms - ${error.message}` }],
       isError: true,
     };
   }
@@ -165,6 +212,20 @@ export const registerRoomTools: ToolRegistrationFunction = (server) => {
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     listJoinedRoomsHandler
+  );
+
+  server.registerTool(
+    "list-active-rooms",
+    {
+      title: "List Recently Active Matrix Rooms",
+      description: "List joined rooms with activity since a timestamp, newest first, without room names or message bodies",
+      inputSchema: {
+        since: z.string().describe("ISO-8601 lower bound for room activity"),
+        limit: z.number().int().min(1).max(100).default(20).describe("Maximum rooms to return"),
+      },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    listActiveRoomsHandler
   );
 
   // Tool: Get room information
