@@ -381,6 +381,14 @@ async function createMatrixClientUncached(
   let recoveryKeySource = recoveryKeyState.source;
   const recoveryKeySourceName = recoveryKeyState.sourceName;
   const hasUserProvidedRecoveryKey = recoveryKeySource === "env" || recoveryKeySource === "file";
+  let markInitialSyncReady: (() => void) | undefined;
+  let markInitialSyncFailed: ((error: Error) => void) | undefined;
+  const initialSyncReady = matrixPassword || hasUserProvidedRecoveryKey
+    ? new Promise<void>((resolve, reject) => {
+        markInitialSyncReady = resolve;
+        markInitialSyncFailed = reject;
+      })
+    : Promise.resolve();
 
   const createSdkClient = () =>
     sdk.createClient({
@@ -436,6 +444,10 @@ async function createMatrixClientUncached(
       // E2EE will become available once bootstrap completes.
       (async () => {
       try {
+        // Restoring thousands of backed-up room keys can monopolize the Rust
+        // crypto worker. Let the initial /sync reach PREPARED first so client
+        // creation and MCP reads do not time out while recovery runs.
+        await initialSyncReady;
         const crypto = client.getCrypto();
         if (crypto) {
           // Load or generate a recovery key for SSSS.
@@ -692,6 +704,7 @@ async function createMatrixClientUncached(
         setTimeout(() => reject(new Error(`Matrix initial sync timed out after ${SYNC_TIMEOUT_MS / 1000}s`)), SYNC_TIMEOUT_MS)
       ),
     ]);
+    markInitialSyncReady?.();
 
     // Set presence to online so other users can see the bot is active.
     // The homeserver automatically marks offline when /sync stops (e.g., laptop closed).
@@ -708,6 +721,9 @@ async function createMatrixClientUncached(
     
     return client;
   } catch (error) {
+    markInitialSyncFailed?.(
+      error instanceof Error ? error : new Error(String(error))
+    );
     // If client creation failed, make sure to stop the client and don't cache it
     try {
       client.stopClient();
