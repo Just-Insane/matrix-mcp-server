@@ -11,6 +11,7 @@ import { installIDBAdapter } from "./idb-sqlite-adapter.js";
 import { runMigrations } from "./migrations.js";
 import { decodeRecoveryKey } from "./recovery-key.js";
 import { getMessageQueue } from "./messageQueue.js";
+import { resolveDeviceId } from "./device-id.js";
 
 // Install SQLite-backed IndexedDB before any crypto init.
 // Uses MATRIX_DATA_DIR env var, defaults to .data/ in cwd.
@@ -124,6 +125,7 @@ export interface MatrixClientConfig {
   homeserverUrl: string;
   userId: string;
   accessToken: string;
+  deviceId?: string;
   enableOAuth: boolean;
   tokenExchangeConfig?: TokenExchangeConfig;
   enableTokenExchange: boolean;
@@ -206,6 +208,7 @@ async function createMatrixClientUncached(
     homeserverUrl,
     userId,
     accessToken,
+    deviceId: configuredDeviceId,
     enableOAuth,
     tokenExchangeConfig,
     enableTokenExchange,
@@ -343,16 +346,15 @@ async function createMatrixClientUncached(
       }
     }
   } else {
-    // Non-password mode: fetch deviceId from whoami
-    try {
-      const whoamiRes = await timedFetch(`${homeserverUrl}/_matrix/client/v3/account/whoami`, {
-        headers: { Authorization: `Bearer ${matrixAccessToken}` },
-      });
-      const whoami = await whoamiRes.json() as any;
-      deviceId = whoami.device_id;
-    } catch (e: any) {
-      console.warn("whoami failed, deviceId unknown:", e.message);
-    }
+    // Access-token sessions need an explicit crypto device. Most homeservers
+    // return it from whoami; MATRIX_DEVICE_ID covers homeservers/tokens that do not.
+    deviceId = await resolveDeviceId({
+      configuredDeviceId,
+      homeserverUrl,
+      userId,
+      accessToken: matrixAccessToken,
+      fetchFn: timedFetch,
+    });
   }
 
   // Load SSSS recovery key material from env/file/local cache. This is needed

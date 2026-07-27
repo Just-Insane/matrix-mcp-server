@@ -141,6 +141,7 @@ MATRIX_HOMESERVER_URL="https://matrix.example.com"
 MATRIX_DOMAIN="matrix.example.com"
 MATRIX_USER_ID="@bot:matrix.example.com"
 MATRIX_ACCESS_TOKEN="syt_..."
+MATRIX_DEVICE_ID=""                           # Optional: device for access-token sessions when whoami omits device_id
 MATRIX_DATA_DIR="/var/lib/matrix-mcp/data"  # Persistent crypto store — use an absolute path
 MATRIX_PASSWORD=""                           # Optional: enables cross-signing + SSSS (Phase 2 E2EE)
 MATRIX_RECOVERY_KEY=""                       # Optional: existing Matrix/Element recovery key

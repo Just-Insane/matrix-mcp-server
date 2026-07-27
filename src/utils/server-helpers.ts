@@ -91,6 +91,7 @@ export async function createConfiguredMatrixClient(
     homeserverUrl,
     userId: matrixUserId,
     accessToken,
+    deviceId: process.env.MATRIX_DEVICE_ID,
     enableOAuth: ENABLE_OAUTH,
     tokenExchangeConfig: tokenExchangeConfig,
     enableTokenExchange: ENABLE_TOKEN_EXCHANGE,
