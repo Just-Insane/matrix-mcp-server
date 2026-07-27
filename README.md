@@ -58,11 +58,11 @@ The server speaks E2EE natively. It uses a custom SQLite-backed IndexedDB adapte
 ### How it works
 
 - **Phase 1** (automatic): Olm/Megolm crypto state is stored in `MATRIX_DATA_DIR` as a SQLite database. Device identity is stable across restarts, so other clients can trust and share keys with the server.
-- **Phase 2** (optional): Cross-signing and SSSS (Secret Storage) are bootstrapped when `MATRIX_PASSWORD` is set. This enables full user identity verification and key backup.
+- **Phase 2** (optional): An existing SSSS (Secret Storage) and key backup are restored when `MATRIX_RECOVERY_KEY` is set. `MATRIX_PASSWORD` is only needed when cross-signing or SSSS must be created or repaired.
 
 ### Enabling E2EE
 
-Phase 1 is always on. For Phase 2, add your Matrix account password to the env:
+Phase 1 is always on. To create or repair cross-signing and SSSS, add your Matrix account password to the env:
 
 ```bash
 -e MATRIX_PASSWORD=your-matrix-password

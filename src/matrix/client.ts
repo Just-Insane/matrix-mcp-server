@@ -426,11 +426,12 @@ async function createMatrixClientUncached(
     await client.initRustCrypto({ useIndexedDB: true, cryptoDatabasePrefix: cryptoDbPrefix });
     console.error(`[E2EE] Crypto initialised. Device ID: ${client.getDeviceId()}`);
 
-    // Phase 2: SSSS + cross-signing — activated when MATRIX_PASSWORD env var is set.
+    // Phase 2: restore SSSS/key backup when a recovery key is supplied, or
+    // bootstrap/manage cross-signing when MATRIX_PASSWORD is available.
     // IMPORTANT: Check cross-signing status BEFORE bootstrapping. If the user already
     // has cross-signing (e.g., from Element), creating new keys would reset their
     // identity and break trust with all previously verified devices.
-    if (matrixPassword) {
+    if (matrixPassword || hasUserProvidedRecoveryKey) {
       // Phase 2 runs in the background — don't block client creation.
       // E2EE will become available once bootstrap completes.
       (async () => {
