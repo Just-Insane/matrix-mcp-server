@@ -3,7 +3,7 @@ import { MatrixClient, ClientEvent, EventTimeline } from "matrix-js-sdk";
 import https from "https";
 import fetch from "node-fetch";
 import path from "path";
-import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, unlinkSync } from "fs";
+import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, renameSync } from "fs";
 import { randomBytes } from "crypto";
 import { exchangeToken, TokenExchangeConfig } from "../auth/tokenExchange.js";
 import { getCachedClient, cacheClient, removeCachedClient } from "./clientCache.js";
@@ -142,14 +142,29 @@ function getCryptoDatabasePrefix(userId: string): string {
   return userId.replace(/[^a-zA-Z0-9_]/g, "_").replace(/^_+/, "");
 }
 
-function resetCryptoStoreForUser(userId: string): void {
+function archiveCryptoStoreForUser(userId: string): void {
   const cryptoDbPrefix = getCryptoDatabasePrefix(userId);
-  for (const fileName of readdirSync(DATA_DIR)) {
-    if (fileName.startsWith(`${cryptoDbPrefix}_`) || fileName.startsWith(`${cryptoDbPrefix}-`)) {
-      unlinkSync(path.join(DATA_DIR, fileName));
-      console.error(`[E2EE] Removed stale crypto store file ${fileName}`);
-    }
+  const matchingFiles = readdirSync(DATA_DIR).filter(
+    (fileName) =>
+      fileName.startsWith(`${cryptoDbPrefix}_`) ||
+      fileName.startsWith(`${cryptoDbPrefix}-`)
+  );
+  if (matchingFiles.length === 0) return;
+
+  const archiveDirectory = path.join(
+    DATA_DIR,
+    "stale-crypto",
+    `${Date.now()}-${randomBytes(4).toString("hex")}`
+  );
+  mkdirSync(archiveDirectory, { recursive: true, mode: 0o700 });
+  for (const fileName of matchingFiles) {
+    renameSync(
+      path.join(DATA_DIR, fileName),
+      path.join(archiveDirectory, fileName)
+    );
+    console.error(`[E2EE] Archived stale crypto store file ${fileName}`);
   }
+  console.error(`[E2EE] Stale crypto store preserved at ${archiveDirectory}`);
 }
 
 function restoreRoomPaginationTokens(client: MatrixClient): void {
@@ -328,7 +343,7 @@ async function createMatrixClientUncached(
           effectiveAccessToken = loginData.access_token;
           if (previousLoginDeviceId && previousLoginDeviceId !== loginData.device_id) {
             console.error(`[Auth] Device changed from ${previousLoginDeviceId} to ${loginData.device_id}; resetting stale crypto store`);
-            resetCryptoStoreForUser(userId);
+            archiveCryptoStoreForUser(userId);
           }
           // Persist so we reuse this device on restart
           writeFileSync(loginStateFile, JSON.stringify({
@@ -366,25 +381,28 @@ async function createMatrixClientUncached(
   const recoveryKeySourceName = recoveryKeyState.sourceName;
   const hasUserProvidedRecoveryKey = recoveryKeySource === "env" || recoveryKeySource === "file";
 
-  const client = sdk.createClient({
-    baseUrl: homeserverUrl,
-    userId,
-    ...(deviceId ? { deviceId } : {}),
-    fetchFn: timedFetch,
-    cryptoCallbacks: {
-      // Supplies the SSSS decryption key when the SDK needs to read/write secrets.
-      getSecretStorageKey: async ({ keys }) => {
-        if (!cachedRecoveryKey) return null;
-        const keyId = Object.keys(keys)[0];
-        if (!keyId) return null;
-        return [keyId, cachedRecoveryKey];
+  const createSdkClient = () =>
+    sdk.createClient({
+      baseUrl: homeserverUrl,
+      userId,
+      ...(deviceId ? { deviceId } : {}),
+      fetchFn: timedFetch,
+      cryptoCallbacks: {
+        // Supplies the SSSS decryption key when the SDK needs to read/write secrets.
+        getSecretStorageKey: async ({ keys }) => {
+          if (!cachedRecoveryKey) return null;
+          const keyId = Object.keys(keys)[0];
+          if (!keyId) return null;
+          return [keyId, cachedRecoveryKey];
+        },
+        // Called after bootstrapSecretStorage creates a new key — cache it immediately.
+        cacheSecretStorageKey: (_keyId, _keyInfo, key) => {
+          cachedRecoveryKey = key;
+        },
       },
-      // Called after bootstrapSecretStorage creates a new key — cache it immediately.
-      cacheSecretStorageKey: (_keyId, _keyInfo, key) => {
-        cachedRecoveryKey = key;
-      },
-    },
-  });
+    });
+
+  let client = createSdkClient();
 
   try {
     if (enableOAuth && effectiveAccessToken && enableTokenExchange) {
@@ -404,7 +422,29 @@ async function createMatrixClientUncached(
     // Enable E2EE with persistent SQLite-backed crypto store (always-on).
     // Use userId as crypto DB prefix so each user gets their own SQLite file.
     const cryptoDbPrefix = getCryptoDatabasePrefix(userId);
-    await client.initRustCrypto({ useIndexedDB: true, cryptoDatabasePrefix: cryptoDbPrefix });
+    try {
+      await client.initRustCrypto({ useIndexedDB: true, cryptoDatabasePrefix: cryptoDbPrefix });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const isDeviceStoreMismatch =
+        message.includes("account in the store doesn't match the account in the constructor");
+      if (!isDeviceStoreMismatch || enableOAuth || !effectiveAccessToken || !deviceId) {
+        throw error;
+      }
+
+      // A token can be rotated to a new Matrix device while the durable
+      // volume still contains Rust crypto state for the previous device.
+      // That store can never be opened under the new device identity. Keep
+      // it as rollback evidence, initialize a fresh per-device store, and
+      // preserve the separately cached SSSS recovery key for backup restore.
+      console.error(
+        `[E2EE] Matrix device changed to ${deviceId}; archiving incompatible crypto state and retrying`
+      );
+      archiveCryptoStoreForUser(userId);
+      client = createSdkClient();
+      client.setAccessToken(effectiveAccessToken);
+      await client.initRustCrypto({ useIndexedDB: true, cryptoDatabasePrefix: cryptoDbPrefix });
+    }
     console.error(`[E2EE] Crypto initialised. Device ID: ${client.getDeviceId()}`);
 
     // Phase 2: SSSS + cross-signing — activated when MATRIX_PASSWORD env var is set.
