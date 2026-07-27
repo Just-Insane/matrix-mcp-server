@@ -42,6 +42,7 @@ if (corsAllowedOrigins) {
 }
 
 const PORT = parseInt(process.env.PORT || "3000");
+const HOST = process.env.HOST || "127.0.0.1";
 const ENABLE_OAUTH = process.env.ENABLE_OAUTH === "true";
 const ENABLE_HTTPS = process.env.ENABLE_HTTPS === "true";
 const SSL_KEY_PATH = process.env.SSL_KEY_PATH;
@@ -154,9 +155,9 @@ if (ENABLE_HTTPS) {
     const credentials = { key: privateKey, cert: certificate };
 
     const httpsServer = https.createServer(credentials, app);
-    httpsServer.listen(PORT, "127.0.0.1", () => {
-      console.log(`MCP HTTPS Server listening on port ${PORT}`);
-      console.log(`MCP endpoint: https://localhost:${PORT}/mcp`);
+    httpsServer.listen(PORT, HOST, () => {
+      console.log(`MCP HTTPS Server listening on ${HOST}:${PORT}`);
+      console.log(`MCP endpoint: https://${HOST}:${PORT}/mcp`);
     });
 
     // Graceful shutdown handling for HTTPS server
@@ -182,9 +183,9 @@ if (ENABLE_HTTPS) {
     process.exit(1);
   }
 } else {
-  const server = app.listen(PORT, "127.0.0.1", () => {
-    console.log(`MCP HTTP Server listening on port ${PORT}`);
-    console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
+  const server = app.listen(PORT, HOST, () => {
+    console.log(`MCP HTTP Server listening on ${HOST}:${PORT}`);
+    console.log(`MCP endpoint: http://${HOST}:${PORT}/mcp`);
   });
 
   // Graceful shutdown handling for HTTP server
