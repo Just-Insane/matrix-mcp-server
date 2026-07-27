@@ -217,7 +217,8 @@ export async function createMatrixClient(
 }
 
 async function createMatrixClientUncached(
-  config: MatrixClientConfig
+  config: MatrixClientConfig,
+  allowDeviceStoreRecovery = true
 ): Promise<MatrixClient> {
   const {
     homeserverUrl,
@@ -402,7 +403,7 @@ async function createMatrixClientUncached(
       },
     });
 
-  let client = createSdkClient();
+  const client = createSdkClient();
 
   try {
     if (enableOAuth && effectiveAccessToken && enableTokenExchange) {
@@ -422,29 +423,7 @@ async function createMatrixClientUncached(
     // Enable E2EE with persistent SQLite-backed crypto store (always-on).
     // Use userId as crypto DB prefix so each user gets their own SQLite file.
     const cryptoDbPrefix = getCryptoDatabasePrefix(userId);
-    try {
-      await client.initRustCrypto({ useIndexedDB: true, cryptoDatabasePrefix: cryptoDbPrefix });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const isDeviceStoreMismatch =
-        message.includes("account in the store doesn't match the account in the constructor");
-      if (!isDeviceStoreMismatch || enableOAuth || !effectiveAccessToken || !deviceId) {
-        throw error;
-      }
-
-      // A token can be rotated to a new Matrix device while the durable
-      // volume still contains Rust crypto state for the previous device.
-      // That store can never be opened under the new device identity. Keep
-      // it as rollback evidence, initialize a fresh per-device store, and
-      // preserve the separately cached SSSS recovery key for backup restore.
-      console.error(
-        `[E2EE] Matrix device changed to ${deviceId}; archiving incompatible crypto state and retrying`
-      );
-      archiveCryptoStoreForUser(userId);
-      client = createSdkClient();
-      client.setAccessToken(effectiveAccessToken);
-      await client.initRustCrypto({ useIndexedDB: true, cryptoDatabasePrefix: cryptoDbPrefix });
-    }
+    await client.initRustCrypto({ useIndexedDB: true, cryptoDatabasePrefix: cryptoDbPrefix });
     console.error(`[E2EE] Crypto initialised. Device ID: ${client.getDeviceId()}`);
 
     // Phase 2: SSSS + cross-signing — activated when MATRIX_PASSWORD env var is set.
@@ -733,6 +712,25 @@ async function createMatrixClientUncached(
       client.stopClient();
     } catch (stopError) {
       console.warn("Error stopping failed client:", stopError);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    const isDeviceStoreMismatch =
+      message.includes("account in the store doesn't match the account in the constructor");
+    if (
+      allowDeviceStoreRecovery &&
+      isDeviceStoreMismatch &&
+      !enableOAuth &&
+      effectiveAccessToken &&
+      deviceId
+    ) {
+      // The Rust SDK can defer the account/store identity check until
+      // startClient() begins syncing, so recover at the outer client-start
+      // boundary rather than only around initRustCrypto(). Retry once.
+      console.error(
+        `[E2EE] Matrix device changed to ${deviceId}; archiving incompatible crypto state and retrying`
+      );
+      archiveCryptoStoreForUser(userId);
+      return createMatrixClientUncached(config, false);
     }
     throw error;
   }
