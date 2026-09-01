@@ -12,6 +12,7 @@ import { runMigrations } from "./migrations.js";
 import { decodeRecoveryKey } from "./recovery-key.js";
 import { getMessageQueue } from "./messageQueue.js";
 import { resolveDeviceId } from "./device-id.js";
+import { waitForUsableSync } from "./sync-ready.js";
 
 // Install SQLite-backed IndexedDB before any crypto init.
 // Uses MATRIX_DATA_DIR env var, defaults to .data/ in cwd.
@@ -691,19 +692,17 @@ async function createMatrixClientUncached(
     // but ensures the /sync response arrives before any proxy kills the connection.
     await client.startClient({ initialSyncLimit: 20, pollTimeout: 10_000 });
 
-    // Wait for the initial sync to complete (with 30s timeout to prevent indefinite hangs)
+    // Wait until sync is usable. startClient() can emit PREPARED before its
+    // promise settles, so subscribe and re-check the current state atomically.
     const SYNC_TIMEOUT_MS = 30_000;
-    await Promise.race([
-      new Promise<void>((resolve, reject) => {
-        client.once(ClientEvent.Sync, (state) => {
-          if (state === "PREPARED") resolve();
-          else reject(new Error(`Sync failed with state: ${state}`));
-        });
-      }),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Matrix initial sync timed out after ${SYNC_TIMEOUT_MS / 1000}s`)), SYNC_TIMEOUT_MS)
-      ),
-    ]);
+    await waitForUsableSync(
+      () => client.getSyncState(),
+      (listener) => {
+        client.on(ClientEvent.Sync, listener);
+        return () => client.removeListener(ClientEvent.Sync, listener);
+      },
+      SYNC_TIMEOUT_MS
+    );
     markInitialSyncReady?.();
 
     // Set presence to online so other users can see the bot is active.
