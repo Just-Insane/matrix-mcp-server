@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  INITIAL_SYNC_TIMEOUT_MS,
   isUsableSyncState,
   waitForUsableSync,
   type SyncStateValue,
 } from "../src/matrix/sync-ready.js";
+
+test("cold startup budget exceeds a sync request but remains bounded", () => {
+  assert.ok(INITIAL_SYNC_TIMEOUT_MS > 65_000);
+  assert.ok(INITIAL_SYNC_TIMEOUT_MS <= 120_000);
+});
 
 function syncHarness(initialState: SyncStateValue) {
   let state = initialState;

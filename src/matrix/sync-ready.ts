@@ -1,5 +1,10 @@
 export type SyncStateValue = string | null | undefined;
 
+// Initial room-state processing and crypto catch-up are not a long-poll.
+// Large accounts can exceed 30 seconds even with a healthy homeserver.
+// Keep the startup deadline finite, but above the 65-second sync fetch cap.
+export const INITIAL_SYNC_TIMEOUT_MS = 120_000;
+
 export type SubscribeToSync = (
   listener: (state: SyncStateValue) => void
 ) => () => void;
