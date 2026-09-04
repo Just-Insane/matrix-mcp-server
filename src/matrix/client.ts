@@ -275,7 +275,7 @@ async function createMatrixClientUncached(
     const timeoutMs = isSync ? SYNC_FETCH_TIMEOUT_MS : FETCH_TIMEOUT_MS;
     const scope = boundedRequestSignal(init?.signal, timeoutMs);
     try {
-      return await fetch(input, { ...(init || {}), agent: httpsAgent, signal: scope.signal as any }) as any;
+      return await fetch(input, { ...(init || {}), agent: httpsAgent, signal: scope.signal }) as any;
     } catch (err: any) {
       if (isSync) console.error(`[Sync] /sync fetch failed: ${err.message}`);
       throw err;
