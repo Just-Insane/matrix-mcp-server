@@ -12,7 +12,8 @@ import { runMigrations } from "./migrations.js";
 import { decodeRecoveryKey } from "./recovery-key.js";
 import { getMessageQueue } from "./messageQueue.js";
 import { resolveDeviceId } from "./device-id.js";
-import { waitForUsableSync } from "./sync-ready.js";
+import { INITIAL_SYNC_TIMEOUT_MS, waitForUsableSync } from "./sync-ready.js";
+import { boundedRequestSignal } from "./request-signal.js";
 
 // Install SQLite-backed IndexedDB before any crypto init.
 // Uses MATRIX_DATA_DIR env var, defaults to .data/ in cwd.
@@ -272,15 +273,14 @@ async function createMatrixClientUncached(
     const url = typeof input === "string" ? input : input?.url ?? "";
     const isSync = url.includes("/_matrix/client") && url.includes("/sync");
     const timeoutMs = isSync ? SYNC_FETCH_TIMEOUT_MS : FETCH_TIMEOUT_MS;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const scope = boundedRequestSignal(init?.signal, timeoutMs);
     try {
-      return await fetch(input, { ...(init || {}), agent: httpsAgent, signal: controller.signal as any }) as any;
+      return await fetch(input, { ...(init || {}), agent: httpsAgent, signal: scope.signal }) as any;
     } catch (err: any) {
       if (isSync) console.error(`[Sync] /sync fetch failed: ${err.message}`);
       throw err;
     } finally {
-      clearTimeout(timer);
+      scope.dispose();
     }
   };
 
@@ -694,14 +694,13 @@ async function createMatrixClientUncached(
 
     // Wait until sync is usable. startClient() can emit PREPARED before its
     // promise settles, so subscribe and re-check the current state atomically.
-    const SYNC_TIMEOUT_MS = 30_000;
     await waitForUsableSync(
       () => client.getSyncState(),
       (listener) => {
         client.on(ClientEvent.Sync, listener);
         return () => client.removeListener(ClientEvent.Sync, listener);
       },
-      SYNC_TIMEOUT_MS
+      INITIAL_SYNC_TIMEOUT_MS
     );
     markInitialSyncReady?.();
 
