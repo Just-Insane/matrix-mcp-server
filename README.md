@@ -51,6 +51,65 @@ codex mcp add matrix-server \
 
 > **Important:** Always set `MATRIX_DATA_DIR` to an absolute path. Without it, the server defaults to `{cwd}/.data`, which may vary depending on how your MCP client launches the process — causing a fresh crypto identity on every restart.
 
+### Resume an existing Mac client for scoped reads
+
+For an already-authorized client with a retained login and crypto store, build an
+isolated checkout and register this dedicated launcher with the existing Node
+runtime (Node with `process.execve`, such as the retained Node 26 installation):
+
+```sh
+npm ci
+npm run build
+node scripts/macos-retained-read.mjs --check
+# The stdio registration runs the same launcher without --check.
+node scripts/macos-retained-read.mjs
+```
+
+The launcher reads the current user's existing Keychain settings
+`mcp-matrix-MATRIX_DATA_DIR`, `mcp-matrix-MATRIX_HOMESERVER_URL`, and
+`mcp-matrix-MATRIX_USER_ID`. It reads the token and device privately from
+`login-state.json` in that exact data directory. The login file must be a regular,
+user-owned file with mode `0600`; the existing user's crypto database must be
+present and `data-version` must already equal the current version. Missing,
+different, or outdated state is an error. Do not create a replacement store or
+edit its version marker to make a preflight pass.
+
+This launcher sets `MATRIX_RETAINED_READ=true` and
+`MATRIX_ALLOW_DEVICE_STORE_RECOVERY=false`. Before crypto is opened, the client
+verifies that `whoami` returns both the saved user and saved device. It refuses
+alternate request credentials, password/OAuth login, crypto migrations or
+automatic store replacement. Environment and local recovery-key import,
+cross-signing bootstrap, key-backup restore/upload (including the SDK's automatic
+backup requests), and explicit presence updates are disabled. The existing
+automatic message collector remains enabled, using its original queue in the
+same data directory and its existing joined-room scope. Normal same-device SDK
+crypto/session updates continue.
+Missing historical room keys remain an explicit unavailable result. The launcher
+does not need Bitwarden access and does not change Keychain or saved credentials.
+Dotenv is pinned to `/dev/null` so an unrelated `.env` cannot re-enable bootstrap.
+
+The retained-read server registers room/message lookup tools only; the collector
+does not add queue, action, or admin tools to this catalog. At the relay,
+include these six explicit tools in the existing read group, preserving every
+unrelated current entry:
+
+```text
+matrix-server__list-joined-rooms
+matrix-server__get-room-info
+matrix-server__get-room-messages
+matrix-server__get-messages-by-date
+matrix-server__get-room-history
+matrix-server__get-room-event
+```
+
+Use no whole-server wildcard. Keep deployment source, node runtime and the private
+registration in a recoverable versioned location. Verify the server/tool catalog
+after registration and perform a bounded native lookup before marking the route
+working. Roll back by disabling only this registration/read-group addition and
+restoring its previous registration if one exists; leave the retained data and
+Keychain items in place. The ordinary launcher and its existing modes are
+unchanged.
+
 ## End-to-End Encryption
 
 The server speaks E2EE natively. It uses a custom SQLite-backed IndexedDB adapter (`better-sqlite3`) to persist the [matrix-sdk-crypto](https://github.com/matrix-org/matrix-rust-sdk) state between restarts — no browser required.

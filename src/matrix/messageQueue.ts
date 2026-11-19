@@ -2,9 +2,10 @@ import Database from "better-sqlite3";
 import path from "path";
 import { mkdirSync } from "fs";
 import { EventEmitter } from "events";
+import { isRetainedReadMode } from "./retained-session.js";
 
 const DATA_DIR = process.env.MATRIX_DATA_DIR ?? path.join(process.cwd(), ".data");
-mkdirSync(DATA_DIR, { recursive: true });
+if (!isRetainedReadMode()) mkdirSync(DATA_DIR, { recursive: true });
 const DB_PATH = path.join(DATA_DIR, "message-queue.db");
 
 export interface QueuedMessage {
