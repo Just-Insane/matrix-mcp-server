@@ -146,9 +146,11 @@ function getClientCreationKey(userId: string, homeserverUrl: string): string {
   return `${userId}:${homeserverUrl}`;
 }
 
+class CryptoStoreRecoveryDisabledError extends Error {}
+
 function archiveCryptoStoreForUser(userId: string): void {
   if (retainedSession || process.env.MATRIX_ALLOW_DEVICE_STORE_RECOVERY === "false") {
-    throw new Error("Retained Matrix crypto store replacement is disabled");
+    throw new CryptoStoreRecoveryDisabledError("Retained Matrix crypto store replacement is disabled");
   }
   const cryptoDbPrefix = getCryptoDatabasePrefix(userId);
   const matchingFiles = readdirSync(DATA_DIR).filter(
@@ -348,12 +350,12 @@ async function createMatrixClientUncached(
         });
         const loginData = await loginRes.json() as any;
         if (loginData.access_token && loginData.device_id) {
-          deviceId = loginData.device_id;
-          effectiveAccessToken = loginData.access_token;
           if (previousLoginDeviceId && previousLoginDeviceId !== loginData.device_id) {
-            console.error(`[Auth] Device changed from ${previousLoginDeviceId} to ${loginData.device_id}; resetting stale crypto store`);
+            console.error(`[Auth] Device changed from ${previousLoginDeviceId} to ${loginData.device_id}; checking crypto-store recovery`);
             archiveCryptoStoreForUser(userId);
           }
+          deviceId = loginData.device_id;
+          effectiveAccessToken = loginData.access_token;
           // Persist so we reuse this device on restart
           writeFileSync(loginStateFile, JSON.stringify({
             userId,
@@ -366,6 +368,9 @@ async function createMatrixClientUncached(
           // Fall back to existing token
         }
       } catch (e: any) {
+        // A prohibited store replacement is a fatal preservation decision,
+        // not an authentication failure that may fall back to another token.
+        if (e instanceof CryptoStoreRecoveryDisabledError) throw e;
         console.error(`[Auth] Password login failed: ${e.message}, falling back to access token`);
       }
     }

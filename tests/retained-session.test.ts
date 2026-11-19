@@ -174,3 +174,50 @@ test("module import fails before historical destructive migrations when a versio
   }));
   assert.deepEqual(snapshot(config.dataDir), before);
 });
+
+test("disabled store recovery is fatal during ordinary password login and preserves the saved session", t => {
+  const { config, login } = fixture(t);
+  const before = snapshot(config.dataDir);
+  const certDir = mkdtempSync(path.join(tmpdir(), "matrix-login-test-"));
+  t.after(() => rmSync(certDir, { recursive: true, force: true }));
+  const certConfig = path.join(certDir, "cert.cnf");
+  writeFileSync(certConfig, "[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=localhost\n[ext]\nsubjectAltName=IP:127.0.0.1\n");
+  execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-config", certConfig,
+    "-keyout", path.join(certDir, "key.pem"), "-out", path.join(certDir, "cert.pem")], { stdio: "ignore" });
+  const script = `
+    import { createServer } from 'node:https';
+    import { readFileSync } from 'node:fs';
+    const requests=[];
+    const server=createServer({key:readFileSync(${JSON.stringify(path.join(certDir, "key.pem"))}),
+      cert:readFileSync(${JSON.stringify(path.join(certDir, "cert.pem"))})}, (req,res)=>{
+      requests.push(req.url); res.setHeader('Content-Type','application/json');
+      if(req.url.endsWith('/account/whoami')) {
+        res.writeHead(401); res.end(JSON.stringify({errcode:'M_UNKNOWN_TOKEN'}));
+      } else if(req.url.endsWith('/login')) {
+        res.end(JSON.stringify({access_token:'dummy-new-token',device_id:'NEW_DEVICE'}));
+      } else { res.writeHead(500); res.end('{}'); }
+    });
+    await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+    let errorMessage;
+    try {
+      const {createMatrixClient}=await import('./src/matrix/client.ts');
+      await createMatrixClient({homeserverUrl:'https://127.0.0.1:'+server.address().port,
+        userId:${JSON.stringify(login.userId)},accessToken:'dummy-config-token',enableOAuth:false,enableTokenExchange:false});
+    } catch(error) { errorMessage=error.message; }
+    finally {
+      const {stopCleanupInterval}=await import('./src/matrix/clientCache.ts');
+      stopCleanupInterval();
+      server.closeAllConnections(); await new Promise(resolve=>server.close(resolve));
+    }
+    console.log(JSON.stringify({errorMessage,requests}));
+  `;
+  const output = execFileSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+    cwd: fileURLToPath(new URL("..", import.meta.url)),
+    env: { ...retainedReadEnvironment(config), MATRIX_RETAINED_READ: "false", MATRIX_PASSWORD: "dummy-password",
+      NODE_EXTRA_CA_CERTS: path.join(certDir, "cert.pem") }, encoding: "utf8", timeout: 15000,
+  });
+  const result = JSON.parse(output.trim());
+  assert.equal(result.errorMessage, "Retained Matrix crypto store replacement is disabled");
+  assert.deepEqual(result.requests, ["/_matrix/client/v3/account/whoami", "/_matrix/client/v3/login"]);
+  assert.deepEqual(snapshot(config.dataDir), before);
+});
