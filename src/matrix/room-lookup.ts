@@ -1,17 +1,10 @@
 import { Direction, EventType, type MatrixClient, type MatrixEvent } from "matrix-js-sdk";
+import { requireJoinedRoom } from "./room-access.js";
 
 export type LookupClient = Pick<MatrixClient,
-  "getRoom" | "createMessagesRequest" | "fetchRoomEvent" |
+  "getRoom" | "getJoinedRooms" | "createMessagesRequest" | "fetchRoomEvent" |
   "getEventMapper" | "decryptEventIfNeeded"
 >;
-
-export function requireJoinedRoom(client: Pick<MatrixClient, "getRoom">, roomId: string) {
-  const room = client.getRoom(roomId);
-  if (!room || room.getMyMembership() !== "join") {
-    throw new Error("ROOM_NOT_JOINED");
-  }
-  return room;
-}
 
 function timestamp(event: MatrixEvent): string | null {
   const ts = event.getTs();
@@ -68,8 +61,8 @@ export async function readRoomHistory(
   client: LookupClient,
   { roomId, from, limit = 50 }: { roomId: string; from?: string; limit?: number }
 ) {
-  requireJoinedRoom(client, roomId);
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("INVALID_LIMIT");
+  await requireJoinedRoom(client, roomId);
   const page = await client.createMessagesRequest(roomId, from ?? null, limit, Direction.Backward);
   const mapper = client.getEventMapper();
   const events = await Promise.all(page.chunk.map(raw => {
@@ -97,7 +90,7 @@ export async function readRoomHistory(
 }
 
 export async function readRoomEvent(client: LookupClient, roomId: string, eventId: string) {
-  requireJoinedRoom(client, roomId);
+  await requireJoinedRoom(client, roomId);
   const raw = await client.fetchRoomEvent(roomId, eventId);
   if (raw.event_id !== eventId || (raw.room_id && raw.room_id !== roomId)) {
     throw new Error("INVALID_EVENT_RESPONSE");

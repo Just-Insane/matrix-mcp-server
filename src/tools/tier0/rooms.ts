@@ -5,6 +5,7 @@ import { removeClientFromCache } from "../../matrix/client.js";
 import { shouldEvictClientCache } from "../../utils/matrix-errors.js";
 import { ToolRegistrationFunction } from "../../types/tool-types.js";
 import { NotificationCountType } from "matrix-js-sdk";
+import { listJoinedRoomSummaries, loadRequestedJoinedRoom } from "../../matrix/room-access.js";
 
 // Tool: List joined rooms
 export const listJoinedRoomsHandler = async (_input: any, { requestInfo, authInfo }: any): Promise<CallToolResult> => {
@@ -14,12 +15,16 @@ export const listJoinedRoomsHandler = async (_input: any, { requestInfo, authInf
   try {
     const client = await createConfiguredMatrixClient(homeserverUrl, matrixUserId, accessToken);
 
-    const rooms = client.getRooms().filter((r) => r.getMyMembership() === "join");
+    const rooms = await listJoinedRoomSummaries(client);
     return {
-      content: rooms.map((room) => ({
-        type: "text",
-        text: `Room: ${room.name || "Unnamed Room"} (${room.roomId}) - ${room.getJoinedMemberCount()} members`,
-      })),
+      content: [{ type: "text" as const, text: JSON.stringify({
+        type: "room_list_coverage", membershipSource: "homeserver", roomCount: rooms.length,
+        cachedStateCount: rooms.filter(room => room.stateLoaded).length,
+        note: "Names and member counts are available for cached rooms. Use get-room-info for one requested room; this list does not fetch all room state or history.",
+      }) }, ...rooms.map((room) => ({
+        type: "text" as const,
+        text: `Room: ${room.name || "Name not loaded"} (${room.roomId}) - ${room.memberCount ?? "unknown"} members`,
+      }))],
     };
   } catch (error: any) {
     console.error(`Failed to list joined rooms: ${error.message}`);
@@ -89,18 +94,7 @@ export const getRoomInfoHandler = async ({ roomId }: { roomId: string }, { reque
   
   try {
     const client = await createConfiguredMatrixClient(homeserverUrl, matrixUserId, accessToken);
-    const room = client.getRoom(roomId);
-    if (!room) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: Room with ID ${roomId} not found. You may not be a member of this room.`,
-          },
-        ],
-        isError: true,
-      };
-    }
+    const room = await loadRequestedJoinedRoom(client, roomId);
 
     const roomName = room.name || "Unnamed Room";
     const roomTopic =

@@ -153,6 +153,17 @@ restoring its previous registration if one exists; leave the retained data and
 Keychain items in place. The ordinary launcher and its existing modes are
 unchanged.
 
+A resumed sync cursor can leave the SDK's in-memory room cache empty after a
+restart. Joined-room discovery therefore reads native membership from the
+homeserver. Names and member counts are reported only when already cached;
+`room_list_coverage` makes that distinction explicit. For a requested joined
+room missing usable cached state, the info/recent/date tools read that room's
+state and, when needed, one bounded recent page. The temporary snapshot is not
+inserted into the SDK's live room store: automatic collection keeps its existing
+event wiring, queue and sync cursor. This does not perform an initial sync or
+load every room's history. The native history/event tools can read an authorized
+room directly without requiring that cache.
+
 ## End-to-End Encryption
 
 The server speaks E2EE natively. It uses a custom SQLite-backed IndexedDB adapter (`better-sqlite3`) to persist the [matrix-sdk-crypto](https://github.com/matrix-org/matrix-rust-sdk) state between restarts — no browser required.
@@ -300,7 +311,7 @@ Connect to `http://localhost:3000/mcp` to authenticate and test all available to
 - **`list-joined-rooms`** - Get all rooms the user has joined
 
   - _No parameters required_
-  - Returns room names, IDs, and member counts
+  - Returns source-backed joined room IDs, with names and member counts where cached. Starts with `room_list_coverage`; use `get-room-info` for one requested room whose metadata is not loaded.
 
 - **`get-room-info`** - Get detailed room information
 
@@ -325,7 +336,7 @@ Connect to `http://localhost:3000/mcp` to authenticate and test all available to
   - `startDate` (string): ISO 8601 format (e.g., `2024-01-01T00:00:00Z`)
   - `endDate` (string): ISO 8601 format
   - Returns messages within the specified timeframe
-  - Begins with `history_coverage`: the loaded timeline bounds, stop reason, continuation cursor and undecryptable-event count. A 20-page limit or an unvisited interval is not a no-match result. The SDK can discard its cursor on an empty page, so `endOfAccessibleHistory` is unknown (`null`) on this cached timeline path. Use `get-room-history` with the returned cursor to establish the native source boundary; if null, omit `from` to start from the latest page. When `nextCursorMayRepeatPage` is true, the cursor intentionally re-reads the last requested page; deduplicate by native event ID.
+  - Begins with `history_coverage`: the loaded timeline bounds, stop reason, continuation cursor and undecryptable-event count. `scope` distinguishes a cached live timeline from a `requested_room_snapshot` loaded after a restart. A 20-page limit or an unvisited interval is not a no-match result. The SDK can discard its cursor on an empty page, so `endOfAccessibleHistory` is unknown (`null`) on this timeline path. Use `get-room-history` with the returned cursor to establish the native source boundary; if null, omit `from` to start from the latest page. When `nextCursorMayRepeatPage` is true, the cursor intentionally re-reads the last requested page; deduplicate by native event ID.
 
 - **`get-room-history`** - Read one backward page from an already-joined room
 

@@ -15,6 +15,7 @@ function harness(overrides: Record<string, unknown> = {}) {
   const calls: unknown[][] = [];
   const client = {
     getRoom: () => ({ getMyMembership: () => "join" }),
+    getJoinedRooms: async () => ({ joined_rooms: [] }),
     getEventMapper: () => (event: any) => new MatrixEvent(event),
     decryptEventIfNeeded: async () => {},
     createMessagesRequest: async (...args: unknown[]) => {
@@ -54,13 +55,21 @@ test("only absent end marks the end of accessible history; repeated cursor marks
   assert.equal(page.coverage.endOfAccessibleHistory, false);
 });
 
-test("unjoined rooms fail before any source fetch or membership mutation", async () => {
+test("unjoined rooms fail before any event fetch or membership mutation", async () => {
   for (const membership of ["invite", "leave", "ban", undefined]) {
     const { client, calls } = harness({ getRoom: () => membership ? { getMyMembership: () => membership } : null });
     await assert.rejects(readRoomHistory(client, { roomId }), /ROOM_NOT_JOINED/);
     await assert.rejects(readRoomEvent(client, roomId, "$known"), /ROOM_NOT_JOINED/);
     assert.equal(calls.length, 0);
   }
+});
+
+test("native joined membership permits bounded lookup without cached room state", async () => {
+  const { client, calls } = harness({ getRoom: () => null,
+    getJoinedRooms: async () => ({ joined_rooms: [roomId] }) });
+  assert.equal((await readRoomHistory(client, { roomId, limit: 1 })).events[0].eventId, "$known");
+  assert.equal((await readRoomEvent(client, roomId, "$known")).eventId, "$known");
+  assert.deepEqual(calls, [[roomId, null, 1, "b"], [roomId, "$known"]]);
 });
 
 test("page bounds reject invalid limits before a source fetch", async () => {
