@@ -20,6 +20,7 @@ import { registerRoomAdminTools } from "./tools/tier1/room-admin.js";
 import { registerMessageActionTools } from "./tools/tier1/message-actions.js";
 import { registerServerAdminTools } from "./tools/tier1/server-admin.js";
 import { registerThreadMessageTools } from "./tools/tier1/thread-messages.js";
+import { isRetainedReadMode } from "./matrix/retained-session.js";
 
 /**
  * Create a protocol server instance for one MCP transport.
@@ -48,6 +49,7 @@ export function createServer(): McpServer {
   registerRoomTools(server);        // list-joined-rooms, get-room-info, get-room-members
   registerMessageTools(server);     // get-room-messages, get-messages-by-date, identify-active-users
   registerRoomLookupTools(server);  // get-room-history, get-room-event
+  if (isRetainedReadMode()) return server;
   registerUserTools(server);        // get-user-profile, get-my-profile, get-all-users
   registerSearchTools(server);      // search-public-rooms
   registerNotificationTools(server); // get-notification-counts, get-direct-messages

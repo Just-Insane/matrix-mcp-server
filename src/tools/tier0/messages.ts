@@ -96,9 +96,10 @@ export const getMessagesByDateHandler = async (
       };
     }
 
-    getMessageQueue().setRoomPaginationToken(room.roomId, room.oldState.paginationToken);
-    const history = await backfillRoomHistoryUntil(client, room, startTs, () =>
-      getMessageQueue().setRoomPaginationToken(room.roomId, room.oldState.paginationToken));
+    const savePagination = process.env.MATRIX_RETAINED_READ === "true" ? undefined : () =>
+      getMessageQueue().setRoomPaginationToken(room.roomId, room.oldState.paginationToken);
+    savePagination?.();
+    const history = await backfillRoomHistoryUntil(client, room, startTs, savePagination);
 
     const events = room.getLiveTimeline().getEvents();
     const messages = await processMessagesByDate(events, startDate, endDate, client);

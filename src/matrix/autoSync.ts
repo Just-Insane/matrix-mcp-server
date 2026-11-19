@@ -14,6 +14,7 @@ import { getMessageQueue, QueuedMessage } from "./messageQueue.js";
 import { getCachedClient } from "./clientCache.js";
 import { readFileSync } from "fs";
 import path from "path";
+import { isRetainedReadMode } from "./retained-session.js";
 
 const DATA_DIR = process.env.MATRIX_DATA_DIR ?? path.join(process.cwd(), ".data");
 const KEEPALIVE_INTERVAL_MS = 5 * 60 * 1000;
@@ -101,6 +102,7 @@ function extractQueuedMessage(
  * Call once at MCP server startup. Idempotent — calling again is a no-op.
  */
 export async function startAutoSync(): Promise<void> {
+  if (isRetainedReadMode()) return;
   if (running) return;
   running = true;
 

@@ -14,12 +14,18 @@ import { resolveDeviceId } from "./device-id.js";
 import { INITIAL_SYNC_TIMEOUT_MS, waitForUsableSync } from "./sync-ready.js";
 import { boundedRequestSignal } from "./request-signal.js";
 import { createMatrixHttpsAgent } from "./https-agent.js";
+import { isRetainedReadMode, validateRetainedReadEnvironment, assertRetainedClientConfig,
+  getCryptoDatabasePrefix } from "./retained-session.js";
+import { retainedReadFetch } from "./retained-read-fetch.js";
 
 // Install SQLite-backed IndexedDB before any crypto init.
 // Uses MATRIX_DATA_DIR env var, defaults to .data/ in cwd.
 const DATA_DIR = process.env.MATRIX_DATA_DIR ?? path.join(process.cwd(), ".data");
-mkdirSync(DATA_DIR, { recursive: true });
-runMigrations(DATA_DIR);
+const retainedSession = isRetainedReadMode() ? validateRetainedReadEnvironment() : null;
+if (!retainedSession) {
+  mkdirSync(DATA_DIR, { recursive: true });
+  runMigrations(DATA_DIR);
+}
 installIDBAdapter(DATA_DIR);
 
 type RecoveryKeySource = "env" | "file" | "local" | "generated";
@@ -140,11 +146,10 @@ function getClientCreationKey(userId: string, homeserverUrl: string): string {
   return `${userId}:${homeserverUrl}`;
 }
 
-function getCryptoDatabasePrefix(userId: string): string {
-  return userId.replace(/[^a-zA-Z0-9_]/g, "_").replace(/^_+/, "");
-}
-
 function archiveCryptoStoreForUser(userId: string): void {
+  if (retainedSession || process.env.MATRIX_ALLOW_DEVICE_STORE_RECOVERY === "false") {
+    throw new Error("Retained Matrix crypto store replacement is disabled");
+  }
   const cryptoDbPrefix = getCryptoDatabasePrefix(userId);
   const matchingFiles = readdirSync(DATA_DIR).filter(
     (fileName) =>
@@ -192,6 +197,7 @@ function restoreRoomPaginationTokens(client: MatrixClient): void {
 export async function createMatrixClient(
   config: MatrixClientConfig
 ): Promise<MatrixClient> {
+  if (retainedSession) assertRetainedClientConfig(retainedSession, config);
   if (!config.homeserverUrl) {
     throw new Error("Homeserver URL is required to create a Matrix client.");
   }
@@ -267,6 +273,7 @@ async function createMatrixClientUncached(
   const FETCH_TIMEOUT_MS = 15_000;
   const SYNC_FETCH_TIMEOUT_MS = 65_000; // sync long-poll can wait 30s server-side
   const httpsAgent = createMatrixHttpsAgent();
+  const matrixFetch = retainedSession ? retainedReadFetch(fetch) : fetch;
 
   const timedFetch = async (input: any, init?: any) => {
     // Use longer timeout for /sync long-poll requests
@@ -275,7 +282,7 @@ async function createMatrixClientUncached(
     const timeoutMs = isSync ? SYNC_FETCH_TIMEOUT_MS : FETCH_TIMEOUT_MS;
     const scope = boundedRequestSignal(init?.signal, timeoutMs);
     try {
-      return await fetch(input, { ...(init || {}), agent: httpsAgent, signal: scope.signal }) as any;
+      return await matrixFetch(input, { ...(init || {}), agent: httpsAgent, signal: scope.signal }) as any;
     } catch (err: any) {
       if (isSync) console.error(`[Sync] /sync fetch failed: ${err.message}`);
       throw err;
@@ -289,7 +296,7 @@ async function createMatrixClientUncached(
   // The shared-secret registration device ID ("shared_secret_registration") is a Dendrite
   // placeholder that breaks E2EE key distribution — other clients can't query device keys
   // for it. Password login creates a real device with proper key upload.
-  const matrixPassword = process.env.MATRIX_PASSWORD;
+  const matrixPassword = retainedSession ? undefined : process.env.MATRIX_PASSWORD;
   const loginStateFile = path.join(DATA_DIR, "login-state.json");
   let deviceId: string | undefined;
   let effectiveAccessToken = matrixAccessToken;
@@ -367,6 +374,7 @@ async function createMatrixClientUncached(
     // return it from whoami; MATRIX_DEVICE_ID covers homeservers/tokens that do not.
     deviceId = await resolveDeviceId({
       configuredDeviceId,
+      expectedDeviceId: retainedSession?.deviceId,
       homeserverUrl,
       userId,
       accessToken: matrixAccessToken,
@@ -377,7 +385,7 @@ async function createMatrixClientUncached(
   // Load SSSS recovery key material from env/file/local cache. This is needed
   // by getSecretStorageKey when the SDK unlocks 4S and key backup.
   const recoveryKeyFile = path.join(DATA_DIR, "ssss-recovery-key");
-  const recoveryKeyState = loadRecoveryKey(recoveryKeyFile);
+  const recoveryKeyState: RecoveryKeyState = retainedSession ? {} : loadRecoveryKey(recoveryKeyFile);
   let cachedRecoveryKey = recoveryKeyState.key;
   let recoveryKeySource = recoveryKeyState.source;
   const recoveryKeySourceName = recoveryKeyState.sourceName;
@@ -706,13 +714,14 @@ async function createMatrixClientUncached(
 
     // Set presence to online so other users can see the bot is active.
     // The homeserver automatically marks offline when /sync stops (e.g., laptop closed).
-    try {
-      await client.setPresence({ presence: "online" });
-    } catch (_) {
-      // Presence may not be supported by all homeservers (e.g., Dendrite)
+    if (!retainedSession) {
+      try {
+        await client.setPresence({ presence: "online" });
+      } catch (_) {
+        // Presence may not be supported by all homeservers (e.g., Dendrite)
+      }
+      restoreRoomPaginationTokens(client);
     }
-
-    restoreRoomPaginationTokens(client);
 
     // Cache the successfully created and synced client
     cacheClient(client, userId, homeserverUrl);
@@ -733,6 +742,7 @@ async function createMatrixClientUncached(
       message.includes("account in the store doesn't match the account in the constructor");
     if (
       allowDeviceStoreRecovery &&
+      !retainedSession && process.env.MATRIX_ALLOW_DEVICE_STORE_RECOVERY !== "false" &&
       isDeviceStoreMismatch &&
       !enableOAuth &&
       effectiveAccessToken &&

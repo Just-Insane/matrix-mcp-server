@@ -98,3 +98,18 @@ test("rejects invalid and mismatched access tokens before crypto setup", async (
     /belongs to @mallory:example.com/
   );
 });
+
+test("retained sessions verify the configured device through whoami before crypto setup", async () => {
+  let calls = 0;
+  const options = { configuredDeviceId: "SAVED_DEVICE", expectedDeviceId: "SAVED_DEVICE",
+    homeserverUrl: "https://matrix.example.com", userId: "@alice:example.com", accessToken: "dummy-token" };
+  const deviceId = await resolveDeviceId({ ...options, fetchFn: async () => {
+    calls++; return response({ user_id: options.userId, device_id: "SAVED_DEVICE" });
+  } });
+  assert.equal(deviceId, "SAVED_DEVICE");
+  assert.equal(calls, 1);
+  await assert.rejects(resolveDeviceId({ ...options, fetchFn: async () =>
+    response({ user_id: options.userId, device_id: "DIFFERENT_DEVICE" }) }), /does not match the retained session/);
+  await assert.rejects(resolveDeviceId({ ...options, fetchFn: async () =>
+    response({ user_id: options.userId }) }), /did not return a device_id/);
+});

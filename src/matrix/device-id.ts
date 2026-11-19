@@ -11,6 +11,7 @@ export type DeviceIdFetch = (
 
 interface ResolveDeviceIdOptions {
   configuredDeviceId?: string;
+  expectedDeviceId?: string;
   homeserverUrl: string;
   userId: string;
   accessToken: string;
@@ -25,13 +26,14 @@ interface WhoAmIResponse {
 
 export async function resolveDeviceId({
   configuredDeviceId,
+  expectedDeviceId,
   homeserverUrl,
   userId,
   accessToken,
   fetchFn,
 }: ResolveDeviceIdOptions): Promise<string> {
   const explicitDeviceId = configuredDeviceId?.trim();
-  if (explicitDeviceId) {
+  if (explicitDeviceId && !expectedDeviceId) {
     return explicitDeviceId;
   }
 
@@ -59,6 +61,10 @@ export async function resolveDeviceId({
     throw new Error(
       "Matrix whoami did not return a device_id; set MATRIX_DEVICE_ID to the device associated with MATRIX_ACCESS_TOKEN"
     );
+  }
+
+  if (expectedDeviceId && body.device_id.trim() !== expectedDeviceId) {
+    throw new Error("Matrix token device does not match the retained session; crypto store was not opened");
   }
 
   return body.device_id.trim();
