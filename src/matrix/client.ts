@@ -720,8 +720,8 @@ async function createMatrixClientUncached(
       } catch (_) {
         // Presence may not be supported by all homeservers (e.g., Dendrite)
       }
-      restoreRoomPaginationTokens(client);
     }
+    restoreRoomPaginationTokens(client);
 
     // Cache the successfully created and synced client
     cacheClient(client, userId, homeserverUrl);

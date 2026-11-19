@@ -377,7 +377,6 @@ class MessageQueue extends EventEmitter {
 let instance: MessageQueue | null = null;
 
 export function getMessageQueue(): MessageQueue {
-  if (isRetainedReadMode()) throw new Error("Message queue is disabled in retained Matrix read mode");
   if (!instance) {
     instance = new MessageQueue();
   }

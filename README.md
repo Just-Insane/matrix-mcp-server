@@ -80,13 +80,16 @@ verifies that `whoami` returns both the saved user and saved device. It refuses
 alternate request credentials, password/OAuth login, crypto migrations or
 automatic store replacement. Environment and local recovery-key import,
 cross-signing bootstrap, key-backup restore/upload (including the SDK's automatic
-backup requests), explicit presence updates, and the persistent message-body
-collector are disabled. Normal same-device SDK crypto/session updates continue.
+backup requests), and explicit presence updates are disabled. The existing
+automatic message collector remains enabled, using its original queue in the
+same data directory and its existing joined-room scope. Normal same-device SDK
+crypto/session updates continue.
 Missing historical room keys remain an explicit unavailable result. The launcher
 does not need Bitwarden access and does not change Keychain or saved credentials.
 Dotenv is pinned to `/dev/null` so an unrelated `.env` cannot re-enable bootstrap.
 
-The retained-read server registers room/message lookup tools only. At the relay,
+The retained-read server registers room/message lookup tools only; the collector
+does not add queue, action, or admin tools to this catalog. At the relay,
 include these six explicit tools in the existing read group, preserving every
 unrelated current entry:
 

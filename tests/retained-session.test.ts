@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, chmodSync, symlinkSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, chmodSync, symlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -113,18 +113,27 @@ test("source guards reject injected bootstrap inputs and alternate request crede
   }
 });
 
-test("real module imports and MCP catalog leave fixture stores unchanged and never start the collector", t => {
+test("retained mode keeps the existing collector enabled while preserving crypto state and the scoped catalog", t => {
   const { config } = fixture(t);
   const before = snapshot(config.dataDir);
   const script = `
     import { createServer } from './src/server.ts';
-    import { startAutoSync, isAutoSyncRunning } from './src/matrix/autoSync.ts';
-    import { getMessageQueue } from './src/matrix/messageQueue.ts';
+    import { startAutoSync, stopAutoSync, isAutoSyncRunning } from './src/matrix/autoSync.ts';
+    import { getMessageQueue, closeMessageQueue } from './src/matrix/messageQueue.ts';
     import { createMatrixClient } from './src/matrix/client.ts';
     import { Client } from '@modelcontextprotocol/sdk/client/index.js';
     import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-    await startAutoSync();
-    let queueBlocked=false; try { getMessageQueue(); } catch { queueBlocked=true; }
+    // Enter the actual collector path, but make its client guard stop before
+    // network/crypto access. A disabled/no-op collector would not reach this error.
+    const savedToken=process.env.MATRIX_ACCESS_TOKEN;
+    process.env.MATRIX_ACCESS_TOKEN='different';
+    let collectorAttempted=false;
+    try { await startAutoSync(); } catch(error) {
+      collectorAttempted=error.message.includes('saved client identity');
+    }
+    process.env.MATRIX_ACCESS_TOKEN=savedToken;
+    const queueAvailable=!!getMessageQueue();
+    stopAutoSync(); closeMessageQueue();
     let alternateClientBlocked=false;
     try { await createMatrixClient({ homeserverUrl:process.env.MATRIX_HOMESERVER_URL, userId:process.env.MATRIX_USER_ID,
       accessToken:'different', deviceId:process.env.MATRIX_DEVICE_ID, enableOAuth:false, enableTokenExchange:false }); }
@@ -134,7 +143,7 @@ test("real module imports and MCP catalog leave fixture stores unchanged and nev
     await server.connect(right); await client.connect(left);
     const catalog=await client.listTools();
     await client.close(); await server.close();
-    console.log(JSON.stringify({running:isAutoSyncRunning(),queueBlocked,alternateClientBlocked,
+    console.log(JSON.stringify({running:isAutoSyncRunning(),collectorAttempted,queueAvailable,alternateClientBlocked,
       tools:catalog.tools.map(tool=>tool.name)}));
   `;
   const output = execFileSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
@@ -143,11 +152,15 @@ test("real module imports and MCP catalog leave fixture stores unchanged and nev
   });
   const result = JSON.parse(output.trim());
   assert.equal(result.running, false);
-  assert.equal(result.queueBlocked, true);
+  assert.equal(result.collectorAttempted, true);
+  assert.equal(result.queueAvailable, true);
   assert.equal(result.alternateClientBlocked, true);
   assert.deepEqual(result.tools.sort(), ["get-messages-by-date", "get-room-event", "get-room-history", "get-room-info",
     "get-room-members", "get-room-messages", "identify-active-users", "list-active-rooms", "list-joined-rooms"].sort());
-  assert.deepEqual(snapshot(config.dataDir), before);
+  assert.equal(existsSync(path.join(config.dataDir, "message-queue.db")), true);
+  for (const [name, contents] of Object.entries(before)) {
+    assert.equal(readFileSync(path.join(config.dataDir, name), "utf8"), contents);
+  }
 });
 
 test("module import fails before historical destructive migrations when a version marker is missing", t => {
