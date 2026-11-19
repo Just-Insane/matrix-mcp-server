@@ -340,13 +340,15 @@ Connect to `http://localhost:3000/mcp` to authenticate and test all available to
   - Returns messages within the specified timeframe
   - Begins with `history_coverage`: the loaded timeline bounds, stop reason, continuation cursor and undecryptable-event count. `scope` distinguishes a cached live timeline from a `requested_room_snapshot` loaded after a restart. A 20-page limit or an unvisited interval is not a no-match result. The SDK can discard its cursor on an empty page, so `endOfAccessibleHistory` is unknown (`null`) on this timeline path. Use `get-room-history` with the returned cursor to establish the native source boundary; if null, omit `from` to start from the latest page. When `nextCursorMayRepeatPage` is true, the cursor intentionally re-reads the last requested page; deduplicate by native event ID.
 
-- **`get-room-history`** - Read one backward page from an already-joined room
+- **`get-room-history`** - Read one bounded page from an already-joined room
 
   - `roomId` (string): Authorized Matrix room ID
-  - `from` (string, optional): Native `coverage.nextCursor` from the preceding page for the same room; omit for the latest page
+  - `direction` (`backward` or `forward`, default: `backward`): Server pagination order, newest first or oldest first
+  - `from` (string, optional): Native `coverage.nextCursor` from the preceding page for the same room and direction. Omit for the latest page (`backward`) or this client's first visible event (`forward`).
   - `limit` (integer, default: 50, maximum: 100): Maximum events in the page
   - Returns original event IDs and `matrix.to` permalinks, text where available, and explicit redacted or `encrypted_unavailable` status. It does not download attachments or write events to the message queue.
-  - An empty page may still have a continuation. Continue only as needed for the bounded lookup. `endOfAccessibleHistory` means the server has no more history visible to this client; it does not distinguish retention, membership visibility, or the actual start of the room. Stop on `paginationStalled`.
+  - `coverage.firstVisibleEventId` identifies the first visible event in server pagination order only on a nonempty initial forward page. It can be a state event and need not have the minimum timestamp when bridges backfill older messages. A one-event forward page can establish this client's visible timeline start without traversing the room; this does not prove complete historical message or key coverage. This uses the native [first/last visible event behavior](https://spec.matrix.org/latest/client-server-api/#get_matrixclientv3roomsroomidmessages).
+  - An empty page may still have a continuation. Continue only as needed for the bounded lookup. `endOfAccessibleHistory` means the server has no more events visible to this client **in the requested direction**; `reachedHistoryBoundary` is `oldest` for exhausted backward reads, `latest` for exhausted forward reads, and otherwise `null`. These limits do not distinguish retention, membership visibility, or the actual start of the room. Stop on `paginationStalled`.
 
 - **`get-room-event`** - Reopen one exact original event
 

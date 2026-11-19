@@ -59,11 +59,15 @@ export async function describeRoomEvent(client: LookupClient, roomId: string, ev
 
 export async function readRoomHistory(
   client: LookupClient,
-  { roomId, from, limit = 50 }: { roomId: string; from?: string; limit?: number }
+  { roomId, from, limit = 50, direction = "backward" }: {
+    roomId: string; from?: string; limit?: number; direction?: "backward" | "forward";
+  }
 ) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("INVALID_LIMIT");
+  if (direction !== "backward" && direction !== "forward") throw new Error("INVALID_DIRECTION");
   await requireJoinedRoom(client, roomId);
-  const page = await client.createMessagesRequest(roomId, from ?? null, limit, Direction.Backward);
+  const page = await client.createMessagesRequest(roomId, from ?? null, limit,
+    direction === "forward" ? Direction.Forward : Direction.Backward);
   const mapper = client.getEventMapper();
   const events = await Promise.all(page.chunk.map(raw => {
     if (raw.room_id && raw.room_id !== roomId) throw new Error("INVALID_EVENT_RESPONSE");
@@ -73,7 +77,7 @@ export async function readRoomHistory(
   const dates = events.map(event => event.timestamp).filter((date): date is string => date !== null).sort();
   return {
     roomId,
-    direction: "backward" as const,
+    direction,
     events,
     coverage: {
       scope: "this_page" as const,
@@ -81,8 +85,13 @@ export async function readRoomHistory(
       oldestTimestamp: dates[0] ?? null,
       newestTimestamp: dates.at(-1) ?? null,
       nextCursor,
-      // An empty page can still have a continuation. Only absent `end` means exhaustion.
+      // Exhaustion is in the requested direction. An empty page can still continue.
       endOfAccessibleHistory: nextCursor === null,
+      reachedHistoryBoundary: nextCursor === null ? (direction === "forward" ? "latest" : "oldest") : null,
+      // No `from` + forward starts at this user's first visible event in server
+      // pagination order, not necessarily the minimum timestamp (e.g. bridge backfills).
+      // An empty page cannot establish an event pointer, even with a continuation.
+      firstVisibleEventId: direction === "forward" && from === undefined ? events[0]?.eventId ?? null : null,
       paginationStalled: nextCursor !== null && nextCursor === from,
       encryptedUnavailable: events.filter(event => event.status === "encrypted_unavailable").length,
     },
