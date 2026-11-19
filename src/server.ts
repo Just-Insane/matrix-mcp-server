@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 // Tier 0 (Read-only tools)
 import { registerRoomTools } from "./tools/tier0/rooms.js";
 import { registerMessageTools } from "./tools/tier0/messages.js";
+import { registerRoomLookupTools } from "./tools/tier0/room-lookup.js";
 import { registerUserTools } from "./tools/tier0/users.js";
 import { registerSearchTools } from "./tools/tier0/search.js";
 import { registerNotificationTools } from "./tools/tier0/notifications.js";
@@ -46,6 +47,7 @@ export function createServer(): McpServer {
   // Tier 0: Read-only Matrix tools
   registerRoomTools(server);        // list-joined-rooms, get-room-info, get-room-members
   registerMessageTools(server);     // get-room-messages, get-messages-by-date, identify-active-users
+  registerRoomLookupTools(server);  // get-room-history, get-room-event
   registerUserTools(server);        // get-user-profile, get-my-profile, get-all-users
   registerSearchTools(server);      // search-public-rooms
   registerNotificationTools(server); // get-notification-counts, get-direct-messages

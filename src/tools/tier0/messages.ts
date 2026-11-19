@@ -6,40 +6,7 @@ import { getMessageQueue } from "../../matrix/messageQueue.js";
 import { shouldEvictClientCache } from "../../utils/matrix-errors.js";
 import { processMessage, processMessagesByDate, countMessagesByUser } from "../../matrix/messageProcessor.js";
 import { ToolRegistrationFunction } from "../../types/tool-types.js";
-
-const DEFAULT_SCROLLBACK_BATCH_SIZE = 100;
-const MAX_SCROLLBACK_BATCHES = 20;
-
-async function backfillRoomHistoryUntil(
-  client: any,
-  room: any,
-  targetStartTs: number
-): Promise<void> {
-  let batchesLoaded = 0;
-  const queue = getMessageQueue();
-
-  while (room.oldState.paginationToken !== null && batchesLoaded < MAX_SCROLLBACK_BATCHES) {
-    const events = room.getLiveTimeline().getEvents();
-    const earliestEventTs = events.length > 0 ? Math.min(...events.map((event: any) => event.getTs())) : Number.POSITIVE_INFINITY;
-
-    if (earliestEventTs <= targetStartTs) {
-      return;
-    }
-
-    const beforeCount = events.length;
-    await client.scrollback(room, DEFAULT_SCROLLBACK_BATCH_SIZE);
-    const afterEvents = room.getLiveTimeline().getEvents();
-    const afterCount = afterEvents.length;
-    queue.setRoomPaginationToken(room.roomId, room.oldState.paginationToken);
-
-    // Stop if no additional events were loaded.
-    if (afterCount <= beforeCount) {
-      return;
-    }
-
-    batchesLoaded += 1;
-  }
-}
+import { backfillRoomHistoryUntil } from "../../matrix/history-coverage.js";
 
 // Tool: Get room messages
 export const getRoomMessagesHandler = async (
@@ -110,6 +77,11 @@ export const getMessagesByDateHandler = async (
   const accessToken = getAccessToken(requestInfo?.headers, authInfo?.token);
   
   try {
+    const startTs = Date.parse(startDate);
+    const endTs = Date.parse(endDate);
+    if (!Number.isFinite(startTs) || !Number.isFinite(endTs) || startTs > endTs) {
+      throw new Error("Invalid date range: supply a valid start at or before the end.");
+    }
     const client = await createConfiguredMatrixClient(homeserverUrl, matrixUserId, accessToken);
     const room = client.getRoom(roomId);
     if (!room) {
@@ -124,25 +96,34 @@ export const getMessagesByDateHandler = async (
       };
     }
 
-    const startTs = new Date(startDate).getTime();
     getMessageQueue().setRoomPaginationToken(room.roomId, room.oldState.paginationToken);
-    await backfillRoomHistoryUntil(client, room, startTs);
+    const history = await backfillRoomHistoryUntil(client, room, startTs, () =>
+      getMessageQueue().setRoomPaginationToken(room.roomId, room.oldState.paginationToken));
 
     const events = room.getLiveTimeline().getEvents();
     const messages = await processMessagesByDate(events, startDate, endDate, client);
+    const dates = events.map(event => event.getTs()).filter(Number.isFinite).sort((a, b) => a - b);
+    const encryptedUnavailable = events.filter(event => event.getTs() >= startTs && event.getTs() <= endTs &&
+      (event.isDecryptionFailure() || event.getType() === "m.room.encrypted")).length;
+    const historyCoverage = {
+      type: "history_coverage", roomId, startDate, endDate,
+      scope: "loaded_live_timeline", ...history,
+      earliestLoadedTimestamp: dates.length ? new Date(dates[0]).toISOString() : null,
+      latestLoadedTimestamp: dates.length ? new Date(dates[dates.length - 1]).toISOString() : null,
+      encryptedUnavailable,
+      note: "A bounded timeline read cannot establish provider exhaustion; the SDK can lose a cursor on an empty page. Use get-room-history with nextCursor (or omit from when null) to continue. Missing keys are not a no-match result.",
+    };
 
     return {
-      content:
+      content: [{ type: "text" as const, text: JSON.stringify(historyCoverage) }, ...(
         messages.length > 0
           ? messages
           : [
               {
-                type: "text",
-                text: `No messages found in room ${
-                  room.name || roomId
-                } between ${startDate} and ${endDate}`,
+                type: "text" as const,
+                text: "No message was returned from the loaded timeline in this window. Check history_coverage before concluding there is no match.",
               },
-            ],
+            ])],
     };
   } catch (error: any) {
     console.error(`Failed to filter messages by date: ${error.message}`);

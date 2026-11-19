@@ -223,6 +223,23 @@ Connect to `http://localhost:3000/mcp` to authenticate and test all available to
   - `startDate` (string): ISO 8601 format (e.g., `2024-01-01T00:00:00Z`)
   - `endDate` (string): ISO 8601 format
   - Returns messages within the specified timeframe
+  - Begins with `history_coverage`: the loaded timeline bounds, stop reason, continuation cursor and undecryptable-event count. A 20-page limit or an unvisited interval is not a no-match result. The SDK can discard its cursor on an empty page, so `endOfAccessibleHistory` is unknown (`null`) on this cached timeline path. Use `get-room-history` with the returned cursor to establish the native source boundary; if null, omit `from` to start from the latest page. When `nextCursorMayRepeatPage` is true, the cursor intentionally re-reads the last requested page; deduplicate by native event ID.
+
+- **`get-room-history`** - Read one backward page from an already-joined room
+
+  - `roomId` (string): Authorized Matrix room ID
+  - `from` (string, optional): Native `coverage.nextCursor` from the preceding page for the same room; omit for the latest page
+  - `limit` (integer, default: 50, maximum: 100): Maximum events in the page
+  - Returns original event IDs and `matrix.to` permalinks, text where available, and explicit redacted or `encrypted_unavailable` status. It does not download attachments or write events to the message queue.
+  - An empty page may still have a continuation. Continue only as needed for the bounded lookup. `endOfAccessibleHistory` means the server has no more history visible to this client; it does not distinguish retention, membership visibility, or the actual start of the room. Stop on `paginationStalled`.
+
+- **`get-room-event`** - Reopen one exact original event
+
+  - `roomId` (string): Already-joined room ID
+  - `eventId` (string): Exact native event ID from a previous source result
+  - Uses the room event endpoint and the existing client's keys. Returns the same native ID and permalink, or an explicit source/decryption failure. An original event does not establish complete thread or edit history.
+
+For a read-only portal, publish an explicit allowlist of the needed read tools. Do not expose the entire MCP endpoint or assume every tool under `tier0` is appropriate: queue replay and administrative/action tools are not part of source lookup. These lookup tools neither join rooms nor establish new clients, credentials, or keys outside the server's existing client lifecycle.
 
 - **`identify-active-users`** - Find most active users by message count
   - `roomId` (string): Matrix room ID
@@ -411,6 +428,7 @@ src/
 - 🔐 **Token Management**: Matrix clients are cached per user and reused across tool calls; access tokens stay server-side
 - 🛡️ **OAuth Integration**: Prevents direct Matrix token exposure through OAuth proxy
 - 🔍 **Permission Checks**: Respects Matrix room power levels and permissions
+- **Matrix TLS**: Outbound Matrix requests verify the server certificate and hostname using Node's normal trust store. If an authorized private CA is required, configure `NODE_EXTRA_CA_CERTS` before launch; do not disable certificate verification.
 - 🚫 **Input Validation**: Comprehensive parameter validation using Zod schemas
 - 🌐 **CORS Support**: Configurable origin restrictions for web clients
 
