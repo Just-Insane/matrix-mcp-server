@@ -74,9 +74,14 @@ const bootstrapVariables = [
 
 export function retainedReadEnvironment(
   config: RetainedSessionConfig,
-  inherited: NodeJS.ProcessEnv = process.env
+  inherited: NodeJS.ProcessEnv = process.env,
+  expectedCredentials?: { accessToken: string; deviceId: string }
 ): NodeJS.ProcessEnv {
   const saved = loadRetainedSession(config);
+  if (expectedCredentials && (!expectedCredentials.accessToken || !expectedCredentials.deviceId ||
+      expectedCredentials.accessToken !== saved.accessToken || expectedCredentials.deviceId !== saved.deviceId)) {
+    fail("startup credentials must match the saved token and device");
+  }
   return {
     ...inherited,
     ...Object.fromEntries(bootstrapVariables.map(name => [name, ""])),
