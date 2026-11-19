@@ -6,7 +6,7 @@ import { getMessageQueue } from "../../matrix/messageQueue.js";
 import { shouldEvictClientCache } from "../../utils/matrix-errors.js";
 import { processMessage, processMessagesByDate, countMessagesByUser } from "../../matrix/messageProcessor.js";
 import { ToolRegistrationFunction } from "../../types/tool-types.js";
-import { backfillRoomHistoryUntil } from "../../matrix/history-coverage.js";
+import { backfillRoomHistoryForLookup } from "../../matrix/history-coverage.js";
 import { loadRequestedJoinedRoom } from "../../matrix/room-access.js";
 
 // Tool: Get room messages
@@ -75,9 +75,8 @@ export const getMessagesByDateHandler = async (
     const client = await createConfiguredMatrixClient(homeserverUrl, matrixUserId, accessToken);
     const room = await loadRequestedJoinedRoom(client, roomId, 20);
 
-    getMessageQueue().setRoomPaginationToken(room.roomId, room.oldState.paginationToken);
-    const history = await backfillRoomHistoryUntil(client, room, startTs, () =>
-      getMessageQueue().setRoomPaginationToken(room.roomId, room.oldState.paginationToken));
+    const history = await backfillRoomHistoryForLookup(client, room, startTs, (id, cursor) =>
+      getMessageQueue().setRoomPaginationToken(id, cursor));
 
     const events = room.getLiveTimeline().getEvents();
     const messages = await processMessagesByDate(events, startDate, endDate, client);

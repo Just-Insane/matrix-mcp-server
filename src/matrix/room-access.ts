@@ -38,7 +38,7 @@ export async function listJoinedRoomSummaries(client: RoomMembershipClient) {
  * No sync cursor, queue contents, client, device, or membership is replaced.
  */
 export async function loadRequestedJoinedRoom(client: MatrixClient, roomId: string, timelineLimit = 0): Promise<Room> {
-  if (!Number.isInteger(timelineLimit) || timelineLimit < 0 || timelineLimit > 100) throw new Error("INVALID_LIMIT");
+  if (!Number.isInteger(timelineLimit) || timelineLimit < 0) throw new Error("INVALID_LIMIT");
   const cached = await requireJoinedRoom(client, roomId);
   if (cached && (timelineLimit === 0 || cached.getLiveTimeline().getEvents().length > 0)) return cached;
 
@@ -56,8 +56,11 @@ export async function loadRequestedJoinedRoom(client: MatrixClient, roomId: stri
   // Recheck the returned state in case membership changed during these reads.
   if (room.getMyMembership() !== "join") throw new Error("ROOM_NOT_JOINED");
   if (timelineLimit > 0) {
-    const page = await client.createMessagesRequest(roomId, null, timelineLimit, Direction.Backward);
-    room.addEventsToTimeline(page.chunk.map(mapEvent), true, true, room.getLiveTimeline());
+    // Preserve larger cached-read limits while keeping a cold source read bounded.
+    const page = await client.createMessagesRequest(roomId, null, Math.min(timelineLimit, 100), Direction.Backward);
+    const events = page.chunk.map(mapEvent);
+    await Promise.all(events.map(event => client.decryptEventIfNeeded(event).catch(() => undefined)));
+    room.addEventsToTimeline(events, true, true, room.getLiveTimeline());
     room.oldState.paginationToken = page.end ?? null;
   }
   return room;

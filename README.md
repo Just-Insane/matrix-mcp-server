@@ -158,9 +158,11 @@ restart. Joined-room discovery therefore reads native membership from the
 homeserver. Names and member counts are reported only when already cached;
 `room_list_coverage` makes that distinction explicit. For a requested joined
 room missing usable cached state, the info/recent/date tools read that room's
-state and, when needed, one bounded recent page. The temporary snapshot is not
-inserted into the SDK's live room store: automatic collection keeps its existing
-event wiring, queue and sync cursor. This does not perform an initial sync or
+state and, when needed, one recent page capped at 100 events, awaiting decryption
+before formatting recent messages. The temporary snapshot is not inserted into
+the SDK's live room store, and its pagination cursor is not persisted over the
+live timeline's cursor. Automatic collection keeps its existing event wiring,
+queue and sync cursor. This does not perform an initial sync or
 load every room's history. The native history/event tools can read an authorized
 room directly without requiring that cache.
 

@@ -1,5 +1,19 @@
 import type { MatrixClient, Room } from "matrix-js-sdk";
 
+/** Persist only a live room's cursor; temporary lookup snapshots have a different timeline. */
+export async function backfillRoomHistoryForLookup(
+  client: Pick<MatrixClient, "getRoom" | "scrollback">,
+  room: Room,
+  targetStartTs: number,
+  persistCursor: (roomId: string, cursor: string | null) => void
+) {
+  const persistIfLive = () => {
+    if (client.getRoom(room.roomId) === room) persistCursor(room.roomId, room.oldState.paginationToken);
+  };
+  persistIfLive();
+  return backfillRoomHistoryUntil(client, room, targetStartTs, persistIfLive);
+}
+
 /** Preserve the existing 20-page bound, but explain every early stop. */
 export async function backfillRoomHistoryUntil(
   client: Pick<MatrixClient, "scrollback">,

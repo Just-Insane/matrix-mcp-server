@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createClient, MatrixEvent, Room, type IStateEventWithRoomId } from "matrix-js-sdk";
 import { listJoinedRoomSummaries, loadRequestedJoinedRoom } from "../src/matrix/room-access.js";
-import { backfillRoomHistoryUntil } from "../src/matrix/history-coverage.js";
+import { backfillRoomHistoryForLookup } from "../src/matrix/history-coverage.js";
 
 const roomId = "!personal:example.invalid";
 const userId = "@fixture:example.invalid";
@@ -89,7 +89,7 @@ test("a membership source failure is propagated rather than presented as an empt
   await assert.rejects(loadRequestedJoinedRoom(client, roomId), error => error === denied);
 });
 
-test("existing bounded date scrollback works on the requested-room snapshot without changing sync state", async () => {
+test("bounded snapshot date scrollback preserves both sync and persisted room pagination cursors", async () => {
   const { client } = fixture();
   const room = await loadRequestedJoinedRoom(client, roomId, 20);
   let pages = 0;
@@ -98,11 +98,51 @@ test("existing bounded date scrollback works on the requested-room snapshot with
     pages++;
     return { chunk: [message("$historical", "2026-11-01T12:00:00Z")], start: "earlier", end: "older-again" };
   };
-  const coverage = await backfillRoomHistoryUntil(client, room, Date.parse("2026-11-02T00:00:00Z"));
+  const persistedRoomCursors = new Map([[roomId, "retained-room-cursor"]]);
+  const coverage = await backfillRoomHistoryForLookup(client, room, Date.parse("2026-11-02T00:00:00Z"),
+    (id, cursor) => persistedRoomCursors.set(id, cursor ?? "exhausted"));
   assert.equal(pages, 1);
   assert.equal(coverage.stoppedBecause, "window_start_reached");
   assert.equal(coverage.nextCursor, "older-again");
   assert.equal(room.getLiveTimeline().getEvents()[0].getId(), "$historical");
   assert.equal(client.getRoom(roomId), null);
   assert.equal(client.store.getSyncToken(), "retained-sync-cursor");
+  assert.equal(persistedRoomCursors.get(roomId), "retained-room-cursor");
+});
+
+test("live date timelines retain their existing pagination persistence", async () => {
+  const { client } = fixture();
+  const room = await loadRequestedJoinedRoom(client, roomId, 20);
+  client.store.storeRoom(room);
+  const writes: unknown[][] = [];
+  client.createMessagesRequest = async () => ({ chunk: [message("$old", "2026-11-01T12:00:00Z")], start: "earlier", end: "live-older" });
+  await backfillRoomHistoryForLookup(client, room, Date.parse("2026-11-02T00:00:00Z"),
+    (id, cursor) => writes.push([id, cursor]));
+  assert.deepEqual(writes, [[roomId, "earlier"], [roomId, "live-older"]]);
+});
+
+test("cold page waits for decryption before its recent messages are returned", async () => {
+  const { client } = fixture();
+  client.getEventMapper = () => raw => new MatrixEvent(raw);
+  client.createMessagesRequest = async () => ({ chunk: [{ ...message("$encrypted", "2026-11-19T12:00:00Z"),
+    type: "m.room.encrypted", content: { algorithm: "m.megolm.v1.aes-sha2" } }], start: "now", end: "older" });
+  let decrypted = false;
+  client.decryptEventIfNeeded = async event => {
+    await new Promise(resolve => setTimeout(resolve, 5));
+    event.setClearData({ clearEvent: { type: "m.room.message", content: { msgtype: "m.text", body: "synthetic decrypted message" } } });
+    decrypted = true;
+  };
+  const room = await loadRequestedJoinedRoom(client, roomId, 20);
+  assert.equal(decrypted, true);
+  assert.equal(room.getLiveTimeline().getEvents()[0].getContent().body, "synthetic decrypted message");
+});
+
+test("larger recent limits cap only the cold source page and preserve cached reads", async () => {
+  const { client, calls } = fixture();
+  const room = await loadRequestedJoinedRoom(client, roomId, 200);
+  assert.deepEqual(calls.at(-1), ["messages", roomId, null, 100, "b"]);
+  client.store.storeRoom(room);
+  calls.length = 0;
+  assert.equal(await loadRequestedJoinedRoom(client, roomId, 200), room);
+  assert.deepEqual(calls, []);
 });
