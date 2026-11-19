@@ -6,7 +6,8 @@ import { getMessageQueue } from "../../matrix/messageQueue.js";
 import { shouldEvictClientCache } from "../../utils/matrix-errors.js";
 import { processMessage, processMessagesByDate, countMessagesByUser } from "../../matrix/messageProcessor.js";
 import { ToolRegistrationFunction } from "../../types/tool-types.js";
-import { backfillRoomHistoryUntil } from "../../matrix/history-coverage.js";
+import { backfillRoomHistoryForLookup } from "../../matrix/history-coverage.js";
+import { loadRequestedJoinedRoom } from "../../matrix/room-access.js";
 
 // Tool: Get room messages
 export const getRoomMessagesHandler = async (
@@ -19,18 +20,7 @@ export const getRoomMessagesHandler = async (
   try {
     const client = await createConfiguredMatrixClient(homeserverUrl, matrixUserId, accessToken);
 
-    const room = client.getRoom(roomId);
-    if (!room) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: Room with ID ${roomId} not found. You may not be a member of this room.`,
-          },
-        ],
-        isError: true,
-      };
-    }
+    const room = await loadRequestedJoinedRoom(client, roomId, limit);
 
     const messages = await Promise.all(
       room
@@ -83,22 +73,10 @@ export const getMessagesByDateHandler = async (
       throw new Error("Invalid date range: supply a valid start at or before the end.");
     }
     const client = await createConfiguredMatrixClient(homeserverUrl, matrixUserId, accessToken);
-    const room = client.getRoom(roomId);
-    if (!room) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: Room with ID ${roomId} not found. You may not be a member of this room.`,
-          },
-        ],
-        isError: true,
-      };
-    }
+    const room = await loadRequestedJoinedRoom(client, roomId, 20);
 
-    getMessageQueue().setRoomPaginationToken(room.roomId, room.oldState.paginationToken);
-    const history = await backfillRoomHistoryUntil(client, room, startTs, () =>
-      getMessageQueue().setRoomPaginationToken(room.roomId, room.oldState.paginationToken));
+    const history = await backfillRoomHistoryForLookup(client, room, startTs, (id, cursor) =>
+      getMessageQueue().setRoomPaginationToken(id, cursor));
 
     const events = room.getLiveTimeline().getEvents();
     const messages = await processMessagesByDate(events, startDate, endDate, client);
@@ -107,7 +85,7 @@ export const getMessagesByDateHandler = async (
       (event.isDecryptionFailure() || event.getType() === "m.room.encrypted")).length;
     const historyCoverage = {
       type: "history_coverage", roomId, startDate, endDate,
-      scope: "loaded_live_timeline", ...history,
+      scope: client.getRoom(roomId) === room ? "loaded_live_timeline" : "requested_room_snapshot", ...history,
       earliestLoadedTimestamp: dates.length ? new Date(dates[0]).toISOString() : null,
       latestLoadedTimestamp: dates.length ? new Date(dates[dates.length - 1]).toISOString() : null,
       encryptedUnavailable,
