@@ -83,6 +83,23 @@ test("exact read calls the event endpoint and rejects a mismatched event or room
   }
 });
 
+test("a cached edited event returns original content with its original identity", async () => {
+  const event = new MatrixEvent(raw());
+  event.makeReplaced(new MatrixEvent({
+    ...raw("$edit"),
+    content: {
+      msgtype: "m.text", body: "* replacement",
+      "m.new_content": { msgtype: "m.text", body: "replacement" },
+      "m.relates_to": { rel_type: "m.replace", event_id: "$known" },
+    },
+  }));
+  assert.equal(event.getContent().body, "replacement");
+  const { client } = harness({ getEventMapper: () => () => event });
+  const result = await readRoomEvent(client, roomId, "$known");
+  assert.equal(result.eventId, "$known");
+  assert.equal("body" in result && result.body, "synthetic known phrase");
+});
+
 test("missing historical keys return an unavailable event with its original pointer", async () => {
   const encrypted = { ...raw(), type: "m.room.encrypted", content: { algorithm: "m.megolm.v1.aes-sha2" } };
   const { client } = harness({
@@ -126,17 +143,29 @@ test("date backfill reports its cap and retains a continuation", async () => {
   assert.equal(pages, 20);
   assert.equal(coverage.stoppedBecause, "batch_limit");
   assert.equal(coverage.nextCursor, "page-20");
-  assert.equal(coverage.endOfAccessibleHistory, false);
+  assert.equal(coverage.endOfAccessibleHistory, null);
 });
 
-test("date backfill continues across empty advancing pages and reports exhaustion", async () => {
+test("date backfill continues while its SDK cursor advances but does not certify exhaustion", async () => {
   const room = { oldState: { paginationToken: "start" as string | null }, getLiveTimeline: () => ({ getEvents: () => [] }) } as unknown as Room;
   let pages = 0;
   const client = { scrollback: async () => { room.oldState.paginationToken = ++pages === 1 ? "older" : null; return room; } };
   const coverage = await backfillRoomHistoryUntil(client as Pick<MatrixClient, "scrollback">, room, 0);
   assert.equal(pages, 2);
-  assert.equal(coverage.stoppedBecause, "history_exhausted");
-  assert.equal(coverage.endOfAccessibleHistory, true);
+  assert.equal(coverage.stoppedBecause, "sdk_pagination_stopped");
+  assert.equal(coverage.endOfAccessibleHistory, null);
+  assert.equal(coverage.nextCursor, "older");
+});
+
+test("SDK empty-page cursor loss leaves provider coverage unknown and retains a resumable page", async () => {
+  const room = { oldState: { paginationToken: "before-empty" as string | null }, getLiveTimeline: () => ({ getEvents: () => [] }) } as unknown as Room;
+  // Installed SDK does this for an empty chunk even when the server returned `end`.
+  const client = { scrollback: async () => { room.oldState.paginationToken = null; return room; } };
+  const coverage = await backfillRoomHistoryUntil(client as Pick<MatrixClient, "scrollback">, room, 0);
+  assert.equal(coverage.stoppedBecause, "sdk_pagination_stopped");
+  assert.equal(coverage.timelineCursorAvailable, false);
+  assert.equal(coverage.endOfAccessibleHistory, null);
+  assert.equal(coverage.nextCursor, "before-empty");
 });
 
 test("date backfill reports no progress without claiming exhaustion", async () => {
@@ -144,5 +173,5 @@ test("date backfill reports no progress without claiming exhaustion", async () =
   const client = { scrollback: async () => room };
   const coverage = await backfillRoomHistoryUntil(client as Pick<MatrixClient, "scrollback">, room, 0);
   assert.equal(coverage.stoppedBecause, "no_progress");
-  assert.equal(coverage.endOfAccessibleHistory, false);
+  assert.equal(coverage.endOfAccessibleHistory, null);
 });

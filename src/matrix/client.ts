@@ -1,6 +1,5 @@
 import * as sdk from "matrix-js-sdk";
 import { MatrixClient, ClientEvent, EventTimeline } from "matrix-js-sdk";
-import https from "https";
 import fetch from "node-fetch";
 import path from "path";
 import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, renameSync } from "fs";
@@ -14,6 +13,7 @@ import { getMessageQueue } from "./messageQueue.js";
 import { resolveDeviceId } from "./device-id.js";
 import { INITIAL_SYNC_TIMEOUT_MS, waitForUsableSync } from "./sync-ready.js";
 import { boundedRequestSignal } from "./request-signal.js";
+import { createMatrixHttpsAgent } from "./https-agent.js";
 
 // Install SQLite-backed IndexedDB before any crypto init.
 // Uses MATRIX_DATA_DIR env var, defaults to .data/ in cwd.
@@ -266,7 +266,7 @@ async function createMatrixClientUncached(
 
   const FETCH_TIMEOUT_MS = 15_000;
   const SYNC_FETCH_TIMEOUT_MS = 65_000; // sync long-poll can wait 30s server-side
-  const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+  const httpsAgent = createMatrixHttpsAgent();
 
   const timedFetch = async (input: any, init?: any) => {
     // Use longer timeout for /sync long-poll requests

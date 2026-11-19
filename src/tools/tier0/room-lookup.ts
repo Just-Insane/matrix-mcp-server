@@ -26,7 +26,7 @@ async function runLookup(context: any, read: (client: LookupClient) => Promise<u
 
 export const registerRoomLookupTools: ToolRegistrationFunction = (server) => {
   const roomId = z.string().min(1).describe("ID of an already-joined, authorized Matrix room");
-  const annotations = { readOnlyHint: true, idempotentHint: true, openWorldHint: false };
+  const annotations = { readOnlyHint: true, idempotentHint: true, openWorldHint: true };
   server.registerTool("get-room-history", {
     title: "Get Matrix Room History Page",
     description: "Read one bounded page of original events from an already-joined room, newest first. " +

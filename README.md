@@ -223,7 +223,7 @@ Connect to `http://localhost:3000/mcp` to authenticate and test all available to
   - `startDate` (string): ISO 8601 format (e.g., `2024-01-01T00:00:00Z`)
   - `endDate` (string): ISO 8601 format
   - Returns messages within the specified timeframe
-  - Begins with `history_coverage`: the loaded timeline bounds, stop reason, continuation cursor and undecryptable-event count. A 20-page limit or an unvisited interval is not a no-match result. This cached timeline read does not guarantee complete provider history.
+  - Begins with `history_coverage`: the loaded timeline bounds, stop reason, continuation cursor and undecryptable-event count. A 20-page limit or an unvisited interval is not a no-match result. The SDK can discard its cursor on an empty page, so `endOfAccessibleHistory` is unknown (`null`) on this cached timeline path. Use `get-room-history` with the returned cursor to establish the native source boundary; if null, omit `from` to start from the latest page. When `nextCursorMayRepeatPage` is true, the cursor intentionally re-reads the last requested page; deduplicate by native event ID.
 
 - **`get-room-history`** - Read one backward page from an already-joined room
 
@@ -428,6 +428,7 @@ src/
 - 🔐 **Token Management**: Matrix clients are cached per user and reused across tool calls; access tokens stay server-side
 - 🛡️ **OAuth Integration**: Prevents direct Matrix token exposure through OAuth proxy
 - 🔍 **Permission Checks**: Respects Matrix room power levels and permissions
+- **Matrix TLS**: Outbound Matrix requests verify the server certificate and hostname using Node's normal trust store. If an authorized private CA is required, configure `NODE_EXTRA_CA_CERTS` before launch; do not disable certificate verification.
 - 🚫 **Input Validation**: Comprehensive parameter validation using Zod schemas
 - 🌐 **CORS Support**: Configurable origin restrictions for web clients
 

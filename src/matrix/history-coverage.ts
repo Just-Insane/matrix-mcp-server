@@ -8,18 +8,23 @@ export async function backfillRoomHistoryUntil(
   onPage: () => void = () => {}
 ) {
   let batchesLoaded = 0;
-  const result = (stoppedBecause: "history_exhausted" | "window_start_reached" | "no_progress" | "batch_limit") => ({
+  let lastRequestedCursor: string | null = null;
+  const result = (stoppedBecause: "sdk_pagination_stopped" | "window_start_reached" | "no_progress" | "batch_limit") => ({
     batchesLoaded, stoppedBecause,
-    nextCursor: room.oldState.paginationToken ?? null,
-    endOfAccessibleHistory: room.oldState.paginationToken === null,
+    nextCursor: room.oldState.paginationToken ?? lastRequestedCursor,
+    nextCursorMayRepeatPage: room.oldState.paginationToken === null && lastRequestedCursor !== null,
+    timelineCursorAvailable: room.oldState.paginationToken !== null,
+    // SDK v37 scrollback discards `end` on empty pages. A null SDK token cannot prove exhaustion.
+    endOfAccessibleHistory: null,
   });
   while (true) {
-    if (room.oldState.paginationToken === null) return result("history_exhausted");
+    if (room.oldState.paginationToken === null) return result("sdk_pagination_stopped");
     const events = room.getLiveTimeline().getEvents();
     const earliest = events.reduce((ts, event) => Math.min(ts, event.getTs()), Infinity);
     if (earliest <= targetStartTs) return result("window_start_reached");
     if (batchesLoaded >= 20) return result("batch_limit");
     const beforeToken = room.oldState.paginationToken;
+    lastRequestedCursor = beforeToken;
     const beforeCount = events.length;
     await client.scrollback(room, 100);
     batchesLoaded += 1;

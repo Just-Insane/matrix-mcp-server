@@ -49,7 +49,8 @@ export async function describeRoomEvent(client: LookupClient, roomId: string, ev
   if (event.getType() !== EventType.RoomMessage) {
     return { ...base, status: "non_message" as const };
   }
-  const content = event.getClearContent() || event.getContent();
+  // getContent() may select a cached/bundled replacement. Keep the original ID/content paired.
+  const content = event.getOriginalContent();
   const relation = content["m.relates_to"];
   return {
     ...base,

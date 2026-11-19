@@ -111,7 +111,7 @@ export const getMessagesByDateHandler = async (
       earliestLoadedTimestamp: dates.length ? new Date(dates[0]).toISOString() : null,
       latestLoadedTimestamp: dates.length ? new Date(dates[dates.length - 1]).toISOString() : null,
       encryptedUnavailable,
-      note: "A bounded timeline read is not a guarantee of complete provider history. Continue with get-room-history if needed; missing keys are not a no-match result.",
+      note: "A bounded timeline read cannot establish provider exhaustion; the SDK can lose a cursor on an empty page. Use get-room-history with nextCursor (or omit from when null) to continue. Missing keys are not a no-match result.",
     };
 
     return {
