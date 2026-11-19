@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MatrixEvent, type MatrixClient, type Room } from "matrix-js-sdk";
+import { createClient, MatrixEvent, type MatrixClient, type Room } from "matrix-js-sdk";
 import { readRoomEvent, readRoomHistory, type LookupClient } from "../src/matrix/room-lookup.js";
 import { backfillRoomHistoryUntil } from "../src/matrix/history-coverage.js";
 
@@ -33,9 +33,75 @@ test("page preserves the native cursor and exact original event link", async () 
   assert.deepEqual(calls, [[roomId, "previous", 3, "b"]]);
   assert.equal(page.coverage.nextCursor, "older");
   assert.equal(page.coverage.endOfAccessibleHistory, false);
+  assert.equal(page.direction, "backward");
+  assert.equal(page.coverage.reachedHistoryBoundary, null);
+  assert.equal(page.coverage.firstVisibleEventId, null);
   assert.equal(page.events[0].eventId, "$known");
   assert.equal(page.events[0].permalink, "https://matrix.to/#/!personal%3Aexample.org/%24known");
   assert.equal(page.events[0].status, "available");
+});
+
+test("forward native read starts at the first visible event and preserves server pagination order", async () => {
+  const client = createClient({ baseUrl: "https://example.invalid", userId: "@fixture:example.invalid" });
+  client.store.setSyncToken("retained-sync-cursor");
+  client.getJoinedRooms = async () => ({ joined_rooms: [roomId] });
+  const calls: unknown[][] = [];
+  // Exercise the real SDK /messages mapping without starting sync or making network requests.
+  // Bridge backfill timestamps need not agree with the server's pagination order.
+  client.http.authedRequest = async (...args: unknown[]) => {
+    calls.push(args);
+    return { start: "first", end: "newer", chunk: [
+      { ...raw("$first-visible"), type: "m.room.create", content: {} },
+      { ...raw("$backfilled"), origin_server_ts: Date.parse("2020-01-01T00:00:00Z") },
+    ] } as any;
+  };
+  const page = await readRoomHistory(client, { roomId, direction: "forward", limit: 2 });
+  assert.deepEqual(calls, [["GET", "/rooms/!personal%3Aexample.org/messages", { limit: "2", dir: "f" }]]);
+  assert.equal(page.direction, "forward");
+  assert.deepEqual(page.events.map(event => event.eventId), ["$first-visible", "$backfilled"]);
+  assert.equal(page.events[0].status, "non_message");
+  assert.equal(page.coverage.firstVisibleEventId, "$first-visible");
+  assert.equal(page.coverage.oldestTimestamp, "2020-01-01T00:00:00.000Z");
+  assert.equal(page.coverage.nextCursor, "newer");
+  assert.equal(page.coverage.endOfAccessibleHistory, false);
+  assert.equal(page.coverage.reachedHistoryBoundary, null);
+  assert.equal(client.store.getSyncToken(), "retained-sync-cursor");
+  assert.equal(client.getRoom(roomId), null);
+
+  client.http.authedRequest = async (...args: unknown[]) => {
+    calls.push(args);
+    return { start: "newer", chunk: [raw("$latest")] } as any;
+  };
+  const next = await readRoomHistory(client, { roomId, direction: "forward", from: page.coverage.nextCursor!, limit: 1 });
+  assert.deepEqual(calls[1], ["GET", "/rooms/!personal%3Aexample.org/messages", { limit: "1", dir: "f", from: "newer" }]);
+  assert.equal(next.coverage.firstVisibleEventId, null);
+  assert.equal(next.coverage.endOfAccessibleHistory, true);
+  assert.equal(next.coverage.reachedHistoryBoundary, "latest");
+  assert.equal(client.store.getSyncToken(), "retained-sync-cursor");
+});
+
+test("empty forward pages do not claim a first visible event and retain continuation or exhaustion", async () => {
+  const { client } = harness({ createMessagesRequest: async () => ({ chunk: [], end: "newer" }) });
+  const page = await readRoomHistory(client, { roomId, direction: "forward", limit: 1 });
+  assert.equal(page.coverage.firstVisibleEventId, null);
+  assert.equal(page.coverage.nextCursor, "newer");
+  assert.equal(page.coverage.endOfAccessibleHistory, false);
+  assert.equal(page.coverage.reachedHistoryBoundary, null);
+  const exhausted = harness({ createMessagesRequest: async () => ({ chunk: [] }) });
+  const empty = await readRoomHistory(exhausted.client, { roomId, direction: "forward", limit: 1 });
+  assert.equal(empty.coverage.firstVisibleEventId, null);
+  assert.equal(empty.coverage.endOfAccessibleHistory, true);
+  assert.equal(empty.coverage.reachedHistoryBoundary, "latest");
+});
+
+test("forward continuation preserves a repeated cursor as a stall rather than a boundary", async () => {
+  const { client, calls } = harness();
+  const page = await readRoomHistory(client, { roomId, direction: "forward", from: "older", limit: 1 });
+  assert.deepEqual(calls, [[roomId, "older", 1, "f"]]);
+  assert.equal(page.coverage.paginationStalled, true);
+  assert.equal(page.coverage.firstVisibleEventId, null);
+  assert.equal(page.coverage.endOfAccessibleHistory, false);
+  assert.equal(page.coverage.reachedHistoryBoundary, null);
 });
 
 test("empty visible page is incomplete when the server provides continuation", async () => {
@@ -48,7 +114,9 @@ test("empty visible page is incomplete when the server provides continuation", a
 
 test("only absent end marks the end of accessible history; repeated cursor marks a stall", async () => {
   const { client } = harness({ createMessagesRequest: async () => ({ chunk: [] }) });
-  assert.equal((await readRoomHistory(client, { roomId })).coverage.endOfAccessibleHistory, true);
+  const exhausted = await readRoomHistory(client, { roomId });
+  assert.equal(exhausted.coverage.endOfAccessibleHistory, true);
+  assert.equal(exhausted.coverage.reachedHistoryBoundary, "oldest");
   const stalled = harness({ createMessagesRequest: async () => ({ chunk: [], end: "same" }) });
   const page = await readRoomHistory(stalled.client, { roomId, from: "same" });
   assert.equal(page.coverage.paginationStalled, true);
@@ -59,6 +127,7 @@ test("unjoined rooms fail before any event fetch or membership mutation", async 
   for (const membership of ["invite", "leave", "ban", undefined]) {
     const { client, calls } = harness({ getRoom: () => membership ? { getMyMembership: () => membership } : null });
     await assert.rejects(readRoomHistory(client, { roomId }), /ROOM_NOT_JOINED/);
+    await assert.rejects(readRoomHistory(client, { roomId, direction: "forward" }), /ROOM_NOT_JOINED/);
     await assert.rejects(readRoomEvent(client, roomId, "$known"), /ROOM_NOT_JOINED/);
     assert.equal(calls.length, 0);
   }
@@ -76,6 +145,14 @@ test("page bounds reject invalid limits before a source fetch", async () => {
   const { client, calls } = harness();
   for (const limit of [0, -1, 101, 1.5, Infinity]) {
     await assert.rejects(readRoomHistory(client, { roomId, limit }), /INVALID_LIMIT/);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("invalid direction is rejected before a source fetch", async () => {
+  const { client, calls } = harness();
+  for (const direction of ["f", "older", "", null]) {
+    await assert.rejects(readRoomHistory(client, { roomId, direction: direction as any }), /INVALID_DIRECTION/);
   }
   assert.equal(calls.length, 0);
 });
