@@ -60,6 +60,21 @@ test("retained mode rejects missing, stale, and future version markers without m
   }
 });
 
+test("host-supplied startup credentials must match the saved token and device", t => {
+  const { config, login } = fixture(t);
+  const before = snapshot(config.dataDir);
+  const credentials = { accessToken: login.accessToken, deviceId: login.deviceId };
+  const env = retainedReadEnvironment(config, {}, credentials);
+  assert.equal(env.MATRIX_ACCESS_TOKEN, login.accessToken);
+  assert.equal(env.MATRIX_DEVICE_ID, login.deviceId);
+  for (const changed of [ { accessToken: "different" }, { accessToken: "" },
+    { deviceId: "OTHER_DEVICE" }, { deviceId: "" } ]) {
+    assert.throws(() => retainedReadEnvironment(config, {}, { ...credentials, ...changed }),
+      /startup credentials must match the saved token and device/);
+  }
+  assert.deepEqual(snapshot(config.dataDir), before);
+});
+
 test("retained mode requires a private saved login with the same user, device, and token", t => {
   const { config, login } = fixture(t);
   const file = path.join(config.dataDir, "login-state.json");

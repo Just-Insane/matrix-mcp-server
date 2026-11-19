@@ -51,11 +51,35 @@ codex mcp add matrix-server \
 
 > **Important:** Always set `MATRIX_DATA_DIR` to an absolute path. Without it, the server defaults to `{cwd}/.data`, which may vary depending on how your MCP client launches the process — causing a fresh crypto identity on every restart.
 
-### Resume an existing Mac client for scoped reads
+### Resume an existing client for scoped reads
 
 For an already-authorized client with a retained login and crypto store, build an
 isolated checkout and register this dedicated launcher with the existing Node
-runtime (Node with `process.execve`, such as the retained Node 26 installation):
+runtime. The launcher requires Node with `process.execve`; the retained Linux
+Node 22.22.1 and Mac Node 26 installations provide it.
+
+On Linux, use the existing host credential wrapper to supply
+`MATRIX_DATA_DIR`, `MATRIX_HOMESERVER_URL`, `MATRIX_USER_ID`,
+`MATRIX_ACCESS_TOKEN`, and `MATRIX_DEVICE_ID` privately. For a Bitwarden-backed
+deployment, the wrapper fetches the existing scoped secret at launch. The generic
+launcher requires the supplied token and device to match the retained
+`login-state.json` exactly; missing or different credentials fail before startup.
+It adds no secret-manager service or credential store. Do not place the token in
+the MCP registration, shell arguments, or logs.
+The wrapper must drop to the owner of the private data directory (the existing
+`mcpagent` account on the VPS) before invoking this launcher. Pass an allowlisted
+environment; BWS machine credentials and its service bearer must not enter the
+Matrix process.
+
+```sh
+npm ci
+npm run build
+# Run through the configured private credential wrapper:
+node scripts/vps-retained-read.mjs --check
+node scripts/vps-retained-read.mjs
+```
+
+The Mac recovery launcher reads its existing Keychain configuration directly:
 
 ```sh
 npm ci
@@ -65,7 +89,7 @@ node scripts/macos-retained-read.mjs --check
 node scripts/macos-retained-read.mjs
 ```
 
-The launcher reads the current user's existing Keychain settings
+The Mac launcher reads the current user's existing Keychain settings
 `mcp-matrix-MATRIX_DATA_DIR`, `mcp-matrix-MATRIX_HOMESERVER_URL`, and
 `mcp-matrix-MATRIX_USER_ID`. It reads the token and device privately from
 `login-state.json` in that exact data directory. The login file must be a regular,
@@ -84,9 +108,28 @@ backup requests), and explicit presence updates are disabled. The existing
 automatic message collector remains enabled, using its original queue in the
 same data directory and its existing joined-room scope. Normal same-device SDK
 crypto/session updates continue.
-Missing historical room keys remain an explicit unavailable result. The launcher
-does not need Bitwarden access and does not change Keychain or saved credentials.
+Missing historical room keys remain an explicit unavailable result. The Mac
+launcher does not need Bitwarden access. Neither launcher changes Keychain or
+saved credentials.
 Dotenv is pinned to `/dev/null` so an unrelated `.env` cannot re-enable bootstrap.
+
+For a host relocation, first stop only this Matrix origin and prevent it from
+relaunching. Wait for its actual process to exit before copying opaque state:
+`login-state.json`, `data-version`, the same user's primary and metadata crypto
+SQLite files with any matching WAL/journal sidecars, the existing
+`message-queue.db` with its sidecars, and `sync-state.json` if present. Use a
+protected direct host-to-host transfer, private destination permissions, and
+verify the copied files before launch. Exclude transient `-shm` files; SQLite
+rebuilds them from the matched database and WAL. Do not query database contents, export
+room keys, or run the same device on both hosts. Leave the standalone
+`ssss-recovery-key`, stale stores, and diagnostics on the original host; retained
+mode does not use them. These application stores must be treated as sensitive;
+the connector does not configure an encryption key for its local crypto store.
+Build native dependencies on Linux using the same lockfile, without copying Mac
+`node_modules`. Keep the original private state as a cutover checkpoint. Once the
+VPS advances crypto or sync state, stop it and transfer the latest matched state
+back before a Mac rollback; do not start the stale Mac checkpoint. Start only one
+host at a time.
 
 The retained-read server registers room/message lookup tools only; the collector
 does not add queue, action, or admin tools to this catalog. At the relay,
