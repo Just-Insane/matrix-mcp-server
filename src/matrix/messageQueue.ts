@@ -3,7 +3,7 @@ import path from "path";
 import { existsSync, mkdirSync } from "fs";
 import { EventEmitter } from "events";
 import { isRetainedReadMode } from "./retained-session.js";
-import { PCP_SELECTION_KEY, PcpSyncHandoff } from "./pcp-sync-handoff.js";
+import { PCP_SELECTION_KEY, PcpSyncHandoff, type PcpLegacyStart } from "./pcp-sync-handoff.js";
 import { canonicalJson, freezeSelection, type PcpSyncSelection } from "./pcp-sync-observation.js";
 
 const DATA_DIR = process.env.MATRIX_DATA_DIR ?? path.join(process.cwd(), ".data");
@@ -314,9 +314,11 @@ export class MessageQueue extends EventEmitter {
     assertSavedPcpSelection(this.db, selection);
   }
 
-  pcpHandoff(selection: PcpSyncSelection): PcpSyncHandoff {
+  pcpHandoff(selection: PcpSyncSelection, start?: PcpLegacyStart): PcpSyncHandoff {
     this.assertPcpSelection(selection);
-    return this.pcp ??= new PcpSyncHandoff(this.db, selection);
+    const handoff = this.pcp ??= new PcpSyncHandoff(this.db, selection, start);
+    handoff.assertStartBoundary(start);
+    return handoff;
   }
 
   getRoomPaginationToken(roomId: string): string | null {

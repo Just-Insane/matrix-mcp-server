@@ -10,7 +10,52 @@ import {
 } from "./pcp-sync-observation.js";
 
 export const PCP_SELECTION_KEY = "pcp_matrix_selection";
+export const PCP_START_BOUNDARY_KEY = "pcp_matrix_start_boundary";
 export const MAX_SYNC_BYTES = 8 * 1024 * 1024;
+export interface PcpLegacyStart {
+  schema: "ea-matrix-pcp-start-v1";
+  selection_sha256: string;
+  checkpoint_sha256: string;
+  decision_ref: string;
+  prior_coverage: "unverified";
+}
+
+/** An operator decision, not proof of earlier capture or an authorization grant.
+ * The opaque cursor itself remains only in the existing sync checkpoint. */
+export function freezePcpLegacyStart(input: PcpLegacyStart, selection: PcpSyncSelection): PcpLegacyStart {
+  const value = JSON.parse(JSON.stringify(input));
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      Object.keys(value).sort().join() !== ["schema", "selection_sha256", "checkpoint_sha256",
+        "decision_ref", "prior_coverage"].sort().join() || value.schema !== "ea-matrix-pcp-start-v1" ||
+      value.selection_sha256 !== digest(canonicalJson(freezeSelection(selection))) ||
+      !/^[a-f0-9]{64}$/.test(value.checkpoint_sha256 ?? "") || value.prior_coverage !== "unverified" ||
+      typeof value.decision_ref !== "string" || !value.decision_ref || value.decision_ref.length > 512 ||
+      /[\u0000-\u001f\u007f]/.test(value.decision_ref)) {
+    throw new Error("Invalid explicit Matrix PCP initial boundary");
+  }
+  return Object.freeze(value);
+}
+
+/** Pure preparation for a separately approved, quiescent startup. This performs
+ * no database read/write, provider request, selection or automatic adoption. */
+export function preparePcpLegacyStart(selection: PcpSyncSelection, checkpoint: string, decisionRef: string): PcpLegacyStart {
+  if (typeof checkpoint !== "string" || !checkpoint || checkpoint.length > 16_384) {
+    throw new Error("Invalid legacy Matrix checkpoint");
+  }
+  return freezePcpLegacyStart({ schema: "ea-matrix-pcp-start-v1",
+    selection_sha256: digest(canonicalJson(freezeSelection(selection))),
+    checkpoint_sha256: digest(checkpoint), decision_ref: decisionRef, prior_coverage: "unverified" }, selection);
+}
+
+function readStartBoundary(db: Database.Database, selection: PcpSyncSelection): PcpLegacyStart | null {
+  const row = db.prepare("SELECT value FROM sync_state WHERE key=?").get(PCP_START_BOUNDARY_KEY) as
+    { value: string } | undefined;
+  if (!row) return null;
+  const value = freezePcpLegacyStart(JSON.parse(row.value), selection);
+  if (canonicalJson(value) !== row.value) throw new Error("Invalid retained Matrix PCP initial boundary");
+  return value;
+}
+
 type State = "ready" | "uncertain" | "acknowledged" | "held";
 export interface PcpObligation {
   id: string;
@@ -44,9 +89,10 @@ export class PcpSyncHandoff {
   readonly selection: PcpSyncSelection;
   readonly selectionDigest: string;
 
-  constructor(private readonly db: Database.Database, input: PcpSyncSelection) {
+  constructor(private readonly db: Database.Database, input: PcpSyncSelection, start?: PcpLegacyStart) {
     this.selection = freezeSelection(input);
     this.selectionDigest = digest(canonicalJson(this.selection));
+    const requested = start === undefined ? undefined : freezePcpLegacyStart(start, this.selection);
     db.pragma("synchronous = FULL");
     db.transaction(() => {
       const existing = db.prepare("SELECT value FROM sync_state WHERE key=?")
@@ -54,8 +100,22 @@ export class PcpSyncHandoff {
       if (existing && existing.value !== canonicalJson(this.selection)) {
         throw new Error("Matrix PCP selection cannot replace retained responsibility");
       }
-      if (!existing && db.prepare("SELECT 1 FROM sync_state WHERE key='sync_token'").get()) {
-        throw new Error("A legacy Matrix cursor cannot seed PCP retention without a retained boundary");
+      const retained = readStartBoundary(db, this.selection);
+      if (!existing && retained || existing && requested && canonicalJson(requested) !== canonicalJson(retained)) {
+        throw new Error("Cannot replace Matrix PCP initial boundary");
+      }
+      if (!existing) {
+        const cursor = db.prepare("SELECT value FROM sync_state WHERE key='sync_token'").get() as
+          { value: string } | undefined;
+        if (cursor && (!requested || !cursor.value || cursor.value.length > 16_384 ||
+            requested.checkpoint_sha256 !== digest(cursor.value))) {
+          throw new Error("A legacy Matrix cursor cannot seed PCP retention without its exact explicit boundary");
+        }
+        if (requested && !cursor) throw new Error("An explicit start requires an existing legacy checkpoint");
+        if (requested && db.prepare("SELECT 1 FROM sqlite_master WHERE name IN " +
+            "('pcp_matrix_sync_batches','pcp_matrix_observations','pcp_matrix_batch_items') LIMIT 1").get()) {
+          throw new Error("Orphaned Matrix PCP custody cannot seed an initial boundary");
+        }
       }
       db.exec(`
         CREATE TABLE IF NOT EXISTS pcp_matrix_sync_batches (
@@ -80,7 +140,24 @@ export class PcpSyncHandoff {
       `);
       db.prepare("INSERT OR IGNORE INTO sync_state(key,value) VALUES (?,?)")
         .run(PCP_SELECTION_KEY, canonicalJson(this.selection));
-    })();
+      if (!existing && requested) {
+        db.prepare("INSERT INTO sync_state(key,value) VALUES (?,?)")
+          .run(PCP_START_BOUNDARY_KEY, canonicalJson(requested));
+      }
+      this.checkpoint();
+    }).immediate();
+  }
+
+  /** Readback of an explicit future start never claims a retained earlier batch. */
+  initialBoundary(): PcpLegacyStart | null {
+    this.assertBinding();
+    return readStartBoundary(this.db, this.selection);
+  }
+
+  assertStartBoundary(start?: PcpLegacyStart): void {
+    if (start !== undefined && canonicalJson(freezePcpLegacyStart(start, this.selection)) !== canonicalJson(this.initialBoundary())) {
+      throw new Error("Cannot replace Matrix PCP initial boundary");
+    }
   }
 
   checkpoint(): string | null {
@@ -89,6 +166,9 @@ export class PcpSyncHandoff {
       { value: string } | undefined;
     const batch = this.db.prepare("SELECT next_token FROM pcp_matrix_sync_batches ORDER BY rowid DESC LIMIT 1")
       .get() as { next_token: string } | undefined;
+    const start = this.initialBoundary();
+    if (!batch && start && row && start.checkpoint_sha256 === digest(row.value)) return row.value;
+    if (!batch && start) throw new Error("Matrix PCP checkpoint has no matching retained batch or explicit boundary");
     if ((row?.value ?? null) !== (batch?.next_token ?? null)) {
       throw new Error("Matrix PCP checkpoint has no matching retained batch");
     }
