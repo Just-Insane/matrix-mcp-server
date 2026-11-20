@@ -123,7 +123,7 @@ export async function startAutoSync(): Promise<void> {
 
   // Persist current sync token
   const currentToken = client.store.getSyncToken();
-  if (currentToken) queue.setSyncToken(currentToken);
+  if (currentToken) queue.mirrorSdkSyncToken(currentToken);
 
   let dmRoomIds = buildDmRoomSet(client);
 
@@ -238,7 +238,7 @@ export async function startAutoSync(): Promise<void> {
   keepAliveHandle = setInterval(() => {
     getCachedClient(matrixUserId, homeserverUrl);
     const token = client.store.getSyncToken();
-    if (token) queue.setSyncToken(token);
+    if (token) queue.mirrorSdkSyncToken(token);
     dmRoomIds = buildDmRoomSet(client);
     queue.cleanup();
   }, KEEPALIVE_INTERVAL_MS);
@@ -263,3 +263,4 @@ export function stopAutoSync(): void {
 export function isAutoSyncRunning(): boolean {
   return running;
 }
+

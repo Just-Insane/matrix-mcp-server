@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test, { after, type TestContext } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import Database from "better-sqlite3";
 import fetch, { Response } from "node-fetch";
 import { createClient, RoomEvent } from "matrix-js-sdk";
@@ -17,7 +18,7 @@ const moduleData = mkdtempSync(path.join(tmpdir(), "matrix-pcp-module-fixture-")
 process.env.MATRIX_DATA_DIR = moduleData;
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async () => { throw new Error("Fixture forbids network outside the supplied fake fetch"); };
-const { MessageQueue, closeMessageQueue } = await import("../src/matrix/messageQueue.js");
+const { MessageQueue, getMessageQueue, closeMessageQueue, assertRetainedPcpSelection } = await import("../src/matrix/messageQueue.js");
 after(() => { closeMessageQueue(); rmSync(moduleData, { recursive: true, force: true }); globalThis.fetch = originalFetch; });
 
 const selection: PcpSyncSelection = {
@@ -40,12 +41,12 @@ const sync = (next = "s1", events: any[] = [event()], extra: any = {}) => Buffer
     "!unselected:example.com": { timeline: { events: [event("$private", { content: { body: "UNSELECTED FIXTURE" } })] } },
   } },
 }));
-function fixture(t: TestContext) {
+function fixture(t: TestContext, resumed = true) {
   const root = mkdtempSync(path.join(tmpdir(), "matrix-pcp-fixture-"));
   const file = path.join(root, "message-queue.db");
   const queue = new MessageQueue(file);
-  queue.setSyncToken("s0");
   const state = { root, file, queue, handoff: queue.pcpHandoff(selection), db: new Database(file) };
+  if (resumed) state.handoff.retain(sync("s0", []), null);
   t.after(() => { if (state.db.open) state.db.close(); state.queue.close(); rmSync(root, { recursive: true, force: true }); });
   return state;
 }
@@ -80,6 +81,40 @@ function receiver(handler: (operation: string, body: string) => Promise<unknown>
     return new Response(JSON.stringify(await handler(headers["x-ea-operation"], String(init?.body))), { status: 200 });
   }) as typeof fetch);
 }
+
+test("legacy cursors cannot create PCP custody and a checkpoint requires its retained batch", t => {
+  const root = mkdtempSync(path.join(tmpdir(), "matrix-pcp-legacy-fixture-"));
+  const file = path.join(root, "message-queue.db"), queue = new MessageQueue(file), db = new Database(file);
+  t.after(() => { db.close(); queue.close(); rmSync(root, { recursive: true, force: true }); });
+  queue.setSyncToken("legacy-without-custody");
+  assert.throws(() => queue.pcpHandoff(selection), /legacy Matrix cursor/);
+  assert.equal(queue.getSyncToken(), "legacy-without-custody");
+  assert.equal(db.prepare("SELECT value FROM sync_state WHERE key='pcp_matrix_selection'").get(), undefined);
+  assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE name LIKE 'pcp_matrix_%'").all(), []);
+  const h = fixture(t);
+  h.db.prepare("UPDATE sync_state SET value='unowned' WHERE key='sync_token'").run();
+  assert.throws(() => h.handoff.checkpoint(), /no matching retained batch/);
+  assert.throws(() => h.handoff.retain(sync(), "unowned"), /no matching retained batch/);
+  assert.equal(h.handoff.obligations().length, 0);
+});
+
+test("startup selection preflight does not create a queue and still rejects an omitted retained binding", t => {
+  const root = mkdtempSync(path.join(tmpdir(), "matrix-pcp-preflight-fixture-"));
+  const file = path.join(root, "message-queue.db");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  assertRetainedPcpSelection(undefined, file);
+  assert.equal(existsSync(file), false);
+  assert.deepEqual(readdirSync(root), []);
+  writeFileSync(file + "-wal", "fabricated orphaned WAL");
+  assert.throws(() => assertRetainedPcpSelection(undefined, file), /custody is incomplete/);
+  assert.equal(existsSync(file), false);
+  const h = fixture(t);
+  assertRetainedPcpSelection(selection, h.file);
+  assert.throws(() => assertRetainedPcpSelection(undefined, h.file), /fixed selection/);
+  assert.throws(() => assertRetainedPcpSelection({ ...selection, deviceId: "OTHER" }, h.file), /fixed selection/);
+  assert.equal(h.handoff.checkpoint(), "s0");
+  assert.equal(h.handoff.obligations().length, 0);
+});
 
 test("wire custody and checkpoint commit before SDK-visible response; no other-room bytes are retained", async t => {
   const h = fixture(t);
@@ -131,7 +166,7 @@ test("a real SQLite failure rolls back sibling observations and checkpoint befor
   await assert.rejects(wrapped(selection.homeserverUrl + "/_matrix/client/v3/sync?since=s0"), /fabricated disk failure/);
   assert.equal(h.queue.getSyncToken(), "s0");
   assert.equal(h.handoff.obligations().length, 0);
-  assert.equal((h.db.prepare("SELECT COUNT(*) AS n FROM pcp_matrix_sync_batches").get() as any).n, 0);
+  assert.equal((h.db.prepare("SELECT COUNT(*) AS n FROM pcp_matrix_sync_batches").get() as any).n, 1);
 });
 
 test("restart after retention, exact replay and duplicate delivery preserve one frozen responsibility", t => {
@@ -223,6 +258,47 @@ test("the actual client factory refuses attaching retention or introducing a par
   await assert.rejects(createMatrixClient(config), /cannot be attached/);
   await assert.rejects(createMatrixClient({ ...config, homeserverUrl: selection.homeserverUrl + "/" }), /second Matrix client/);
   assert.equal(stopped, 0);
+});
+
+for (const initial of ["ordinary", null, "s0"] as const) test("actual autosync startup and timer preserve " +
+  (initial === "ordinary" ? "ordinary cursor mirroring" : "PCP " + (initial === null ? "initial" : "resumed") + " checkpoint authority"), async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  process.env.MATRIX_USER_ID = selection.userId;
+  process.env.MATRIX_HOMESERVER_URL = selection.homeserverUrl;
+  process.env.MATRIX_ACCESS_TOKEN = "fabricated";
+  process.env.MATRIX_DEVICE_ID = selection.deviceId;
+  const { startAutoSync, stopAutoSync } = await import("../src/matrix/autoSync.js");
+  const { cacheClient, shutdownAllClients } = await import("../src/matrix/clientCache.js");
+  const queue = getMessageQueue();
+  const handoff = initial === "ordinary" ? undefined : queue.pcpHandoff(selection);
+  if (initial === "s0") handoff!.retain(sync("s0", []), null);
+  let sdkToken: string | null = initial === "ordinary" ? "ordinary-start" : initial;
+  const cached = Object.assign(new EventEmitter(), {
+    store: { getSyncToken: () => sdkToken }, getSyncState: () => "SYNCING", getUserId: () => selection.userId,
+    getAccountData: () => undefined, getRooms: () => [], stopClient: () => {},
+  });
+  cacheClient(cached as any, selection.userId, selection.homeserverUrl);
+  t.after(() => {
+    stopAutoSync(); shutdownAllClients(); closeMessageQueue();
+    for (const suffix of ["", "-wal", "-shm"]) rmSync(path.join(moduleData, "message-queue.db" + suffix), { force: true });
+    for (const name of ["MATRIX_USER_ID", "MATRIX_HOMESERVER_URL", "MATRIX_ACCESS_TOKEN", "MATRIX_DEVICE_ID"]) delete process.env[name];
+  });
+  await startAutoSync();
+  if (handoff) {
+    handoff.retain(sync("s1"), initial as string | null);
+    t.mock.timers.tick(5 * 60 * 1000); // the SDK still has its previous token
+    assert.equal(handoff.checkpoint(), "s1");
+    sdkToken = "unowned-sdk-token";
+    t.mock.timers.tick(5 * 60 * 1000);
+    assert.equal(handoff.checkpoint(), "s1");
+    assert.throws(() => queue.setSyncToken(sdkToken!), /must commit/);
+    assert.equal(handoff.obligations().length, 1);
+  } else {
+    assert.equal(queue.getSyncToken(), "ordinary-start");
+    sdkToken = "ordinary-next";
+    t.mock.timers.tick(5 * 60 * 1000);
+    assert.equal(queue.getSyncToken(), "ordinary-next");
+  }
 });
 
 test("truncated, ambiguous and oversized syncs cannot move the retained checkpoint", async t => {
@@ -343,12 +419,11 @@ test("uncertain publication cannot move to a different receiver or policy", asyn
 
 for (const initial of [null, "s0"]) test("locked SDK keeps atomic responsibility through " +
   (initial === null ? "initial sync" : "resumed sync") + " and callback failure", { timeout: 6000 }, async t => {
-  const h = fixture(t);
+  const h = fixture(t, initial !== null);
   // The locked SDK's timeoutSignal leaves request deadline timers alive after
   // successful fake fetches. Use its real code with a controlled fixture clock,
   // while SQLite, SDK event processing and setImmediate remain real.
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-  if (initial === null) h.db.prepare("DELETE FROM sync_state WHERE key='sync_token'").run();
   h.db.exec("CREATE TRIGGER sdk_retention_failure BEFORE INSERT ON pcp_matrix_observations " +
     "BEGIN SELECT RAISE(ABORT,'fabricated retention failure'); END");
   const cursors: (string | null)[] = [];

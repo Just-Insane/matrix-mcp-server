@@ -303,12 +303,15 @@ export class MessageQueue extends EventEmitter {
     this.stmts.setSyncToken.run(token);
   }
 
+  /** The SDK may still expose its previous token after the raw response has
+   * committed. Its periodic mirror has no authority to move a PCP checkpoint. */
+  mirrorSdkSyncToken(token: string): void {
+    if (this.db.prepare("SELECT 1 FROM sync_state WHERE key=?").get(PCP_SELECTION_KEY)) return;
+    this.setSyncToken(token);
+  }
+
   assertPcpSelection(selection?: PcpSyncSelection): void {
-    const row = this.db.prepare("SELECT value FROM sync_state WHERE key=?")
-      .get(PCP_SELECTION_KEY) as { value: string } | undefined;
-    if (row && (!selection || row.value !== canonicalJson(freezeSelection(selection)))) {
-      throw new Error("Retained Matrix PCP responsibility requires its fixed selection");
-    }
+    assertSavedPcpSelection(this.db, selection);
   }
 
   pcpHandoff(selection: PcpSyncSelection): PcpSyncHandoff {
@@ -396,21 +399,37 @@ export class MessageQueue extends EventEmitter {
 // Singleton
 let instance: MessageQueue | null = null;
 
+function assertSavedPcpSelection(db: Database.Database, selection?: PcpSyncSelection): void {
+  const row = db.prepare("SELECT value FROM sync_state WHERE key=?")
+    .get(PCP_SELECTION_KEY) as { value: string } | undefined;
+  if (row && (!selection || row.value !== canonicalJson(freezeSelection(selection)))) {
+    throw new Error("Retained Matrix PCP responsibility requires its fixed selection");
+  }
+}
+
+/** Check only saved binding metadata before client acquisition. Do not create a
+ * queue or initialize its schema on the ordinary disabled startup path. */
+export function assertRetainedPcpSelection(selection?: PcpSyncSelection, databasePath = DB_PATH): void {
+  if (databasePath === DB_PATH && instance) return instance.assertPcpSelection(selection);
+  if (!existsSync(databasePath)) {
+    if (existsSync(databasePath + "-wal") || existsSync(databasePath + "-shm")) {
+      throw new Error("Matrix queue custody is incomplete; refusing to initialize a replacement");
+    }
+    return;
+  }
+  const db = new Database(databasePath, { readonly: true, fileMustExist: true });
+  try {
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_state'").get()) {
+      assertSavedPcpSelection(db, selection);
+    }
+  } finally { db.close(); }
+}
+
 export function getMessageQueue(): MessageQueue {
   if (!instance) {
     instance = new MessageQueue();
   }
   return instance;
-}
-
-export function assertPcpSelection(selection?: PcpSyncSelection): void {
-  const databaseExists = existsSync(DB_PATH) ||
-    existsSync(`${DB_PATH}-wal`) ||
-    existsSync(`${DB_PATH}-shm`);
-  if (!instance && !databaseExists) {
-    return;
-  }
-  getMessageQueue().assertPcpSelection(selection);
 }
 
 export function closeMessageQueue(): void {
@@ -419,3 +438,4 @@ export function closeMessageQueue(): void {
     instance = null;
   }
 }
+
