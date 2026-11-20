@@ -50,10 +50,9 @@ A selection cannot be attached to an already running unbound client or replace
 a different pending selection. Ordinary callers may reuse the bound client.
 A database with retained responsibility cannot silently omit or replace its
 selection on restart. A standalone legacy cursor cannot seed a new retention
-boundary: binding refuses it before writing PCP tables or the selection key.
-Each resumed checkpoint must match the last committed retained batch. This
-source does not add a legacy-cursor adoption interface; any initial custody
-decision for an existing live cursor remains a separate rollout prerequisite.
+boundary by default: binding refuses it before writing PCP tables or the
+selection key. Each resumed checkpoint must match the last committed retained
+batch or the separately recorded explicit initial boundary described below.
 The early saved-selection check opens an existing database read-only and does
 not create a missing queue or initialize schema during ordinary client login.
 The existing collector's periodic SDK-token mirror remains active for ordinary
@@ -63,6 +62,54 @@ the timer. Direct unretained checkpoint writes remain rejected.
 
 The receiver supplies Storage Only policy. This path grants no Search, Graph,
 Attention, model use or destination processing.
+
+### Explicit start after an existing legacy cursor
+
+An existing direct collector has no PCP custody for the history before its
+ordinary saved cursor. The operator may separately approve starting future
+selected retention there. This is a coverage decision, not evidence that the
+earlier history was captured. The default path never makes that decision.
+
+`preparePcpLegacyStart(selection, checkpoint, decisionRef)` is a pure helper:
+it returns an `ea-matrix-pcp-start-v1` record containing the fixed selection's
+digest, the exact opaque cursor's digest, the decision reference and
+`prior_coverage: "unverified"`. It reads no database or provider, creates no
+selection, and contains no raw cursor or credential. A decision reference is
+audit metadata; it does not grant source access or approve its own application.
+
+The host integration can supply this record as `MatrixClientConfig.pcpSyncStart`
+alongside the separately authorized `pcpSync` selection **before creating the
+existing single client**. No environment loader or live configuration is added
+here. A record without its selection, a changed selection/cursor, an unexpected
+field or coverage claim, a missing legacy cursor, or orphaned PCP custody is
+refused. It cannot attach to a running client with a different initial decision.
+
+After authenticating the existing native identity and before its first sync,
+one immediate SQLite transaction validates the current cursor and commits the
+fixed selection plus `pcp_matrix_start_boundary` in the existing `sync_state`.
+It does not alter `sync_token`, copy legacy rendered messages, or invent a
+retained sync batch. A transaction failure rolls back the new binding and
+schema. The locked SDK reads that same existing checkpoint for its first
+request; every successful new response must still retain its selected bytes,
+obligations and next checkpoint before SDK delivery.
+
+`handoff.initialBoundary()` provides exact local readback. An uncertain start
+outcome is reconciled against that record and the normal checkpoint proof;
+the exact already committed input is accepted without changing the cursor or
+replacing responsibility, even after new batches have advanced it. Different
+decisions reject. The initial record remains separate from observed batches,
+and upstream history remains unverified in subsequent coverage.
+
+Applying this decision still requires the existing runtime owner to stop the
+collector watch and old provider, preserve the current state, verify absence
+of the old client, and bind the exact selected policy/decision at the planned
+single-client startup. This source does not enforce cross-process quiescence
+against an older installed binary. The old cursor must be observed only within
+that authorized activation procedure; a stale prepared digest causes refusal.
+After a boundary is committed, a binary without this boundary capability is
+not an eligible active fallback for that state. Preserve the source/state
+receipt and use a qualified reader; do not erase the selection or rewind the
+cursor to make a rollback start.
 
 ## Exact originals and useful partial results
 

@@ -7,7 +7,7 @@ import { EventEmitter } from "node:events";
 import Database from "better-sqlite3";
 import fetch, { Response } from "node-fetch";
 import { createClient, RoomEvent } from "matrix-js-sdk";
-import { assertNativeSelection, retainSyncFetch, MAX_SYNC_BYTES, PcpSyncMemoryStore } from "../src/matrix/pcp-sync-handoff.js";
+import { assertNativeSelection, retainSyncFetch, MAX_SYNC_BYTES, PcpSyncMemoryStore, preparePcpLegacyStart } from "../src/matrix/pcp-sync-handoff.js";
 import { canonicalJson, digest, freezeSelection, type PcpSyncSelection } from "../src/matrix/pcp-sync-observation.js";
 import { PcpReceiver, publishPcpObservation, reconcilePcpObservation } from "../src/matrix/pcp-publication.js";
 
@@ -41,11 +41,13 @@ const sync = (next = "s1", events: any[] = [event()], extra: any = {}) => Buffer
     "!unselected:example.com": { timeline: { events: [event("$private", { content: { body: "UNSELECTED FIXTURE" } })] } },
   } },
 }));
-function fixture(t: TestContext, resumed = true) {
+function fixture(t: TestContext, resumed = true, legacy = false) {
   const root = mkdtempSync(path.join(tmpdir(), "matrix-pcp-fixture-"));
   const file = path.join(root, "message-queue.db");
   const queue = new MessageQueue(file);
-  const state = { root, file, queue, handoff: queue.pcpHandoff(selection), db: new Database(file) };
+  if (legacy) queue.setSyncToken("legacy-start");
+  const start = legacy ? preparePcpLegacyStart(selection, "legacy-start", "fixture:explicit-start") : undefined;
+  const state = { root, file, queue, handoff: queue.pcpHandoff(selection, start), db: new Database(file) };
   if (resumed) state.handoff.retain(sync("s0", []), null);
   t.after(() => { if (state.db.open) state.db.close(); state.queue.close(); rmSync(root, { recursive: true, force: true }); });
   return state;
@@ -417,9 +419,10 @@ test("uncertain publication cannot move to a different receiver or policy", asyn
   assert.equal(calls, 0); assert.equal(h.handoff.state(id), "uncertain");
 });
 
-for (const initial of [null, "s0"]) test("locked SDK keeps atomic responsibility through " +
-  (initial === null ? "initial sync" : "resumed sync") + " and callback failure", { timeout: 6000 }, async t => {
-  const h = fixture(t, initial !== null);
+for (const initial of [null, "s0", "legacy-start"]) test("locked SDK keeps atomic responsibility through " +
+  (initial === null ? "initial sync" : initial === "legacy-start" ? "explicit legacy start" : "resumed sync") +
+  " and callback failure", { timeout: 6000 }, async t => {
+  const h = fixture(t, initial === "s0", initial === "legacy-start");
   // The locked SDK's timeoutSignal leaves request deadline timers alive after
   // successful fake fetches. Use its real code with a controlled fixture clock,
   // while SQLite, SDK event processing and setImmediate remain real.
