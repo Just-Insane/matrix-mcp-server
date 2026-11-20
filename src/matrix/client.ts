@@ -5,7 +5,7 @@ import path from "path";
 import { mkdirSync, existsSync, readFileSync, writeFileSync, readdirSync, renameSync } from "fs";
 import { randomBytes } from "crypto";
 import { exchangeToken, TokenExchangeConfig } from "../auth/tokenExchange.js";
-import { getCachedClient, cacheClient, removeCachedClient } from "./clientCache.js";
+import { getCachedClient, cacheClient, removeCachedClient, getCacheStats } from "./clientCache.js";
 import { installIDBAdapter } from "./idb-sqlite-adapter.js";
 import { runMigrations } from "./migrations.js";
 import { decodeRecoveryKey } from "./recovery-key.js";
@@ -17,6 +17,8 @@ import { createMatrixHttpsAgent } from "./https-agent.js";
 import { isRetainedReadMode, validateRetainedReadEnvironment, assertRetainedClientConfig,
   getCryptoDatabasePrefix } from "./retained-session.js";
 import { retainedReadFetch } from "./retained-read-fetch.js";
+import { assertNativeSelection, retainSyncFetch, PcpSyncMemoryStore, type PcpSyncHandoff } from "./pcp-sync-handoff.js";
+import { canonicalJson, digest, freezeSelection, type PcpSyncSelection } from "./pcp-sync-observation.js";
 
 // Install SQLite-backed IndexedDB before any crypto init.
 // Uses MATRIX_DATA_DIR env var, defaults to .data/ in cwd.
@@ -138,9 +140,23 @@ export interface MatrixClientConfig {
   tokenExchangeConfig?: TokenExchangeConfig;
   enableTokenExchange: boolean;
   syncToken?: string;
+  /** Inactive unless an approved exact host selection is supplied before sync. */
+  pcpSync?: PcpSyncSelection;
 }
 
 const pendingClientCreations = new Map<string, Promise<MatrixClient>>();
+const pendingPcpSelections = new Map<string, string | null>();
+const clientPcpSelections = new WeakMap<MatrixClient, string>();
+
+function selectedPcpDigest(selection?: PcpSyncSelection): string | null {
+  return selection ? digest(canonicalJson(freezeSelection(selection))) : null;
+}
+
+function assertCachedPcpSelection(client: MatrixClient, selection?: PcpSyncSelection): void {
+  if (selection && clientPcpSelections.get(client) !== selectedPcpDigest(selection)) {
+    throw new Error("PCP retention cannot be attached to or replaced on a running Matrix client");
+  }
+}
 
 function getClientCreationKey(userId: string, homeserverUrl: string): string {
   return `${userId}:${homeserverUrl}`;
@@ -199,6 +215,7 @@ function restoreRoomPaginationTokens(client: MatrixClient): void {
 export async function createMatrixClient(
   config: MatrixClientConfig
 ): Promise<MatrixClient> {
+  if (config.pcpSync) config = { ...config, pcpSync: freezeSelection(config.pcpSync) };
   if (retainedSession) assertRetainedClientConfig(retainedSession, config);
   if (!config.homeserverUrl) {
     throw new Error("Homeserver URL is required to create a Matrix client.");
@@ -209,20 +226,33 @@ export async function createMatrixClient(
 
   const cachedClient = getCachedClient(config.userId, config.homeserverUrl);
   if (cachedClient) {
+    assertCachedPcpSelection(cachedClient, config.pcpSync);
     return cachedClient;
+  }
+  if (config.pcpSync && getCacheStats().size > 0) {
+    throw new Error("PCP retention cannot introduce a second Matrix client");
   }
 
   const creationKey = getClientCreationKey(config.userId, config.homeserverUrl);
   const pendingClient = pendingClientCreations.get(creationKey);
   if (pendingClient) {
+    if (config.pcpSync && pendingPcpSelections.get(creationKey) !== selectedPcpDigest(config.pcpSync)) {
+      throw new Error("Pending Matrix client has a different PCP retention selection");
+    }
     console.error(`[Matrix] Reusing pending Matrix client creation for ${config.userId}`);
     return pendingClient;
+  }
+  if (config.pcpSync && pendingClientCreations.size > 0 ||
+      [...pendingPcpSelections.values()].some(selection => selection !== null)) {
+    throw new Error("PCP retention must share the single pending Matrix client");
   }
 
   const clientPromise = createMatrixClientUncached(config).finally(() => {
     pendingClientCreations.delete(creationKey);
+    pendingPcpSelections.delete(creationKey);
   });
   pendingClientCreations.set(creationKey, clientPromise);
+  pendingPcpSelections.set(creationKey, selectedPcpDigest(config.pcpSync));
   return clientPromise;
 }
 
@@ -251,8 +281,10 @@ async function createMatrixClientUncached(
   // Check for cached client first
   const cachedClient = getCachedClient(userId, homeserverUrl);
   if (cachedClient) {
+    assertCachedPcpSelection(cachedClient, config.pcpSync);
     return cachedClient;
   }
+  getMessageQueue().assertPcpSelection(config.pcpSync);
 
   // No cached client, create a new one
   let matrixAccessToken: string;
@@ -275,7 +307,7 @@ async function createMatrixClientUncached(
   const FETCH_TIMEOUT_MS = 15_000;
   const SYNC_FETCH_TIMEOUT_MS = 65_000; // sync long-poll can wait 30s server-side
   const httpsAgent = createMatrixHttpsAgent();
-  const matrixFetch = retainedSession ? retainedReadFetch(fetch) : fetch;
+  let matrixFetch: typeof fetch = retainedSession ? retainedReadFetch(fetch) : fetch;
 
   const timedFetch = async (input: any, init?: any) => {
     // Use longer timeout for /sync long-poll requests
@@ -404,12 +436,24 @@ async function createMatrixClientUncached(
       })
     : Promise.resolve();
 
+  let retentionBound = false;
+  let selectedHandoff: PcpSyncHandoff | undefined;
+  const selectedStore = config.pcpSync ? new PcpSyncMemoryStore(() => selectedHandoff) : undefined;
+  const sdkFetch = async (input: any, init?: any) => {
+    if (retentionBound || !config.pcpSync) return timedFetch(input, init);
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    if (config.pcpSync && /^\/_matrix\/client\/(?:v3|r0)\/sync$/.test(url.pathname)) {
+      throw new Error("Matrix PCP retention must bind before the first SDK sync");
+    }
+    return timedFetch(input, init);
+  };
   const createSdkClient = () =>
     sdk.createClient({
       baseUrl: homeserverUrl,
       userId,
       ...(deviceId ? { deviceId } : {}),
-      fetchFn: timedFetch,
+      ...(selectedStore ? { store: selectedStore } : {}),
+      fetchFn: sdkFetch,
       cryptoCallbacks: {
         // Supplies the SSSS decryption key when the SDK needs to read/write secrets.
         getSecretStorageKey: async ({ keys }) => {
@@ -694,9 +738,28 @@ async function createMatrixClientUncached(
       })();
     }
 
+    let resumeToken = syncToken;
+    if (config.pcpSync) {
+      assertNativeSelection(config.pcpSync, {
+        homeserverUrl: client.getHomeserverUrl(), userId: client.getUserId(), deviceId: client.getDeviceId(),
+      });
+      const handoff = selectedHandoff = getMessageQueue().pcpHandoff(config.pcpSync);
+      const checkpoint = handoff.checkpoint();
+      if (syncToken && checkpoint === null) {
+        throw new Error("A legacy Matrix cursor cannot seed PCP retention without a retained boundary");
+      }
+      // The existing SQLite checkpoint is authoritative after a committed sync,
+      // including when the SDK failed before a caller received that response.
+      resumeToken = checkpoint ?? undefined;
+      // Retention remains inside timedFetch's request deadline through body read
+      // and commit; the disabled path keeps its existing transport unchanged.
+      matrixFetch = retainSyncFetch(matrixFetch, handoff);
+      retentionBound = true;
+      clientPcpSelections.set(client, handoff.selectionDigest);
+    }
     // Resume from a persisted sync token so /sync starts from exactly where we left off.
-    if (syncToken) {
-      client.store.setSyncToken(syncToken);
+    if (resumeToken) {
+      client.store.setSyncToken(resumeToken);
       console.error(`[Sync] Resuming from stored sync token`);
     }
 
@@ -776,3 +839,4 @@ export function removeClientFromCache(userId: string, homeserverUrl: string): vo
   pendingClientCreations.delete(getClientCreationKey(userId, homeserverUrl));
   removeCachedClient(userId, homeserverUrl);
 }
+

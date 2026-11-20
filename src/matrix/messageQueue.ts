@@ -3,6 +3,8 @@ import path from "path";
 import { mkdirSync } from "fs";
 import { EventEmitter } from "events";
 import { isRetainedReadMode } from "./retained-session.js";
+import { PCP_SELECTION_KEY, PcpSyncHandoff } from "./pcp-sync-handoff.js";
+import { canonicalJson, freezeSelection, type PcpSyncSelection } from "./pcp-sync-observation.js";
 
 const DATA_DIR = process.env.MATRIX_DATA_DIR ?? path.join(process.cwd(), ".data");
 if (!isRetainedReadMode()) mkdirSync(DATA_DIR, { recursive: true });
@@ -51,8 +53,9 @@ export interface QueueContents {
   invites: QueuedInvite[];
 }
 
-class MessageQueue extends EventEmitter {
+export class MessageQueue extends EventEmitter {
   private db: Database.Database;
+  private pcp?: PcpSyncHandoff;
 
   private stmts!: {
     insertMessage: Database.Statement;
@@ -70,9 +73,9 @@ class MessageQueue extends EventEmitter {
     updateDecrypted: Database.Statement;
   };
 
-  constructor() {
+  constructor(databasePath = DB_PATH) {
     super();
-    this.db = new Database(DB_PATH);
+    this.db = new Database(databasePath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 5000");
     this.initSchema();
@@ -293,7 +296,24 @@ class MessageQueue extends EventEmitter {
   }
 
   setSyncToken(token: string): void {
+    const selected = this.db.prepare("SELECT value FROM sync_state WHERE key=?").get(PCP_SELECTION_KEY);
+    if (selected && this.getSyncToken() !== token) {
+      throw new Error("Matrix PCP checkpoint must commit with selected raw observations");
+    }
     this.stmts.setSyncToken.run(token);
+  }
+
+  assertPcpSelection(selection?: PcpSyncSelection): void {
+    const row = this.db.prepare("SELECT value FROM sync_state WHERE key=?")
+      .get(PCP_SELECTION_KEY) as { value: string } | undefined;
+    if (row && (!selection || row.value !== canonicalJson(freezeSelection(selection)))) {
+      throw new Error("Retained Matrix PCP responsibility requires its fixed selection");
+    }
+  }
+
+  pcpHandoff(selection: PcpSyncSelection): PcpSyncHandoff {
+    this.assertPcpSelection(selection);
+    return this.pcp ??= new PcpSyncHandoff(this.db, selection);
   }
 
   getRoomPaginationToken(roomId: string): string | null {
@@ -389,3 +409,4 @@ export function closeMessageQueue(): void {
     instance = null;
   }
 }
+
