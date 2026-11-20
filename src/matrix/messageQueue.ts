@@ -1,8 +1,10 @@
 import Database from "better-sqlite3";
 import path from "path";
-import { mkdirSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
 import { EventEmitter } from "events";
 import { isRetainedReadMode } from "./retained-session.js";
+import { PCP_SELECTION_KEY, PcpSyncHandoff } from "./pcp-sync-handoff.js";
+import { canonicalJson, freezeSelection, type PcpSyncSelection } from "./pcp-sync-observation.js";
 
 const DATA_DIR = process.env.MATRIX_DATA_DIR ?? path.join(process.cwd(), ".data");
 if (!isRetainedReadMode()) mkdirSync(DATA_DIR, { recursive: true });
@@ -51,8 +53,9 @@ export interface QueueContents {
   invites: QueuedInvite[];
 }
 
-class MessageQueue extends EventEmitter {
+export class MessageQueue extends EventEmitter {
   private db: Database.Database;
+  private pcp?: PcpSyncHandoff;
 
   private stmts!: {
     insertMessage: Database.Statement;
@@ -70,9 +73,9 @@ class MessageQueue extends EventEmitter {
     updateDecrypted: Database.Statement;
   };
 
-  constructor() {
+  constructor(databasePath = DB_PATH) {
     super();
-    this.db = new Database(DB_PATH);
+    this.db = new Database(databasePath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 5000");
     this.initSchema();
@@ -293,7 +296,27 @@ class MessageQueue extends EventEmitter {
   }
 
   setSyncToken(token: string): void {
+    const selected = this.db.prepare("SELECT value FROM sync_state WHERE key=?").get(PCP_SELECTION_KEY);
+    if (selected && this.getSyncToken() !== token) {
+      throw new Error("Matrix PCP checkpoint must commit with selected raw observations");
+    }
     this.stmts.setSyncToken.run(token);
+  }
+
+  /** The SDK may still expose its previous token after the raw response has
+   * committed. Its periodic mirror has no authority to move a PCP checkpoint. */
+  mirrorSdkSyncToken(token: string): void {
+    if (this.db.prepare("SELECT 1 FROM sync_state WHERE key=?").get(PCP_SELECTION_KEY)) return;
+    this.setSyncToken(token);
+  }
+
+  assertPcpSelection(selection?: PcpSyncSelection): void {
+    assertSavedPcpSelection(this.db, selection);
+  }
+
+  pcpHandoff(selection: PcpSyncSelection): PcpSyncHandoff {
+    this.assertPcpSelection(selection);
+    return this.pcp ??= new PcpSyncHandoff(this.db, selection);
   }
 
   getRoomPaginationToken(roomId: string): string | null {
@@ -376,6 +399,32 @@ class MessageQueue extends EventEmitter {
 // Singleton
 let instance: MessageQueue | null = null;
 
+function assertSavedPcpSelection(db: Database.Database, selection?: PcpSyncSelection): void {
+  const row = db.prepare("SELECT value FROM sync_state WHERE key=?")
+    .get(PCP_SELECTION_KEY) as { value: string } | undefined;
+  if (row && (!selection || row.value !== canonicalJson(freezeSelection(selection)))) {
+    throw new Error("Retained Matrix PCP responsibility requires its fixed selection");
+  }
+}
+
+/** Check only saved binding metadata before client acquisition. Do not create a
+ * queue or initialize its schema on the ordinary disabled startup path. */
+export function assertRetainedPcpSelection(selection?: PcpSyncSelection, databasePath = DB_PATH): void {
+  if (databasePath === DB_PATH && instance) return instance.assertPcpSelection(selection);
+  if (!existsSync(databasePath)) {
+    if (existsSync(databasePath + "-wal") || existsSync(databasePath + "-shm")) {
+      throw new Error("Matrix queue custody is incomplete; refusing to initialize a replacement");
+    }
+    return;
+  }
+  const db = new Database(databasePath, { readonly: true, fileMustExist: true });
+  try {
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_state'").get()) {
+      assertSavedPcpSelection(db, selection);
+    }
+  } finally { db.close(); }
+}
+
 export function getMessageQueue(): MessageQueue {
   if (!instance) {
     instance = new MessageQueue();
@@ -389,3 +438,4 @@ export function closeMessageQueue(): void {
     instance = null;
   }
 }
+
