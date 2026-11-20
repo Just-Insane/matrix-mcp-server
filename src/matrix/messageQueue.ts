@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import path from "path";
-import { mkdirSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
 import { EventEmitter } from "events";
 import { isRetainedReadMode } from "./retained-session.js";
 import { PCP_SELECTION_KEY, PcpSyncHandoff } from "./pcp-sync-handoff.js";
@@ -403,10 +403,19 @@ export function getMessageQueue(): MessageQueue {
   return instance;
 }
 
+export function assertPcpSelection(selection?: PcpSyncSelection): void {
+  const databaseExists = existsSync(DB_PATH) ||
+    existsSync(`${DB_PATH}-wal`) ||
+    existsSync(`${DB_PATH}-shm`);
+  if (!instance && !databaseExists) {
+    return;
+  }
+  getMessageQueue().assertPcpSelection(selection);
+}
+
 export function closeMessageQueue(): void {
   if (instance) {
     instance.close();
     instance = null;
   }
 }
-

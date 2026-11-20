@@ -9,7 +9,7 @@ import { getCachedClient, cacheClient, removeCachedClient, getCacheStats } from 
 import { installIDBAdapter } from "./idb-sqlite-adapter.js";
 import { runMigrations } from "./migrations.js";
 import { decodeRecoveryKey } from "./recovery-key.js";
-import { getMessageQueue } from "./messageQueue.js";
+import { assertPcpSelection, getMessageQueue } from "./messageQueue.js";
 import { resolveDeviceId } from "./device-id.js";
 import { INITIAL_SYNC_TIMEOUT_MS, waitForUsableSync } from "./sync-ready.js";
 import { boundedRequestSignal } from "./request-signal.js";
@@ -284,7 +284,7 @@ async function createMatrixClientUncached(
     assertCachedPcpSelection(cachedClient, config.pcpSync);
     return cachedClient;
   }
-  getMessageQueue().assertPcpSelection(config.pcpSync);
+  assertPcpSelection(config.pcpSync);
 
   // No cached client, create a new one
   let matrixAccessToken: string;
@@ -839,4 +839,3 @@ export function removeClientFromCache(userId: string, homeserverUrl: string): vo
   pendingClientCreations.delete(getClientCreationKey(userId, homeserverUrl));
   removeCachedClient(userId, homeserverUrl);
 }
-
