@@ -1,5 +1,11 @@
 import { createMatrixClient } from "../matrix/client.js";
 import { TokenExchangeConfig } from "../auth/tokenExchange.js";
+import { loadPcpStartup } from "../matrix/pcp-startup.js";
+import { assertNativeSelection } from "../matrix/pcp-sync-handoff.js";
+
+// Freeze one explicit host binding before any configured client is created.
+// Changing a file or environment later cannot attach a new selection to it.
+const pcpStartup = loadPcpStartup();
 
 // Environment configuration
 export const ENABLE_OAUTH = process.env.ENABLE_OAUTH === "true";
@@ -87,6 +93,9 @@ export async function createConfiguredMatrixClient(
       "No access token available. Set MATRIX_ACCESS_TOKEN env var, or provide matrix_access_token header."
     );
   }
+  if (pcpStartup) assertNativeSelection(pcpStartup.selection, {
+    homeserverUrl, userId: matrixUserId, deviceId: process.env.MATRIX_DEVICE_ID ?? null,
+  });
   return createMatrixClient({
     homeserverUrl,
     userId: matrixUserId,
@@ -96,5 +105,7 @@ export async function createConfiguredMatrixClient(
     tokenExchangeConfig: tokenExchangeConfig,
     enableTokenExchange: ENABLE_TOKEN_EXCHANGE,
     syncToken,
+    ...(pcpStartup ? { pcpSync: pcpStartup.selection,
+      ...(pcpStartup.initialBoundary ? { pcpSyncStart: pcpStartup.initialBoundary } : {}) } : {}),
   });
 }
