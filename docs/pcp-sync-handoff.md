@@ -41,10 +41,10 @@ responsibility or independently advance a checkpoint once retention is bound.
 
 ## Inactive host integration
 
-The default application supplies no pcpSync value. A later reviewed host
-integration must pass the approved selection to the **existing single client
-creator before startup**, and use that queue's pcpHandoff(selection). This change
-adds no environment loader, secret store, publisher process or schedule.
+The default application supplies no pcpSync value. The optional private loader
+below passes only an explicitly pinned host selection to the **existing single
+client creator before startup**. It reuses that queue's pcpHandoff(selection).
+No secret store, publisher process or schedule is added.
 
 A selection cannot be attached to an already running unbound client or replace
 a different pending selection. Ordinary callers may reuse the bound client.
@@ -63,6 +63,46 @@ the timer. Direct unretained checkpoint writes remain rejected.
 The receiver supplies Storage Only policy. This path grants no Search, Graph,
 Attention, model use or destination processing.
 
+### Pinned private startup input
+
+The host must explicitly supply both `MATRIX_PCP_STARTUP_FILE` and
+`MATRIX_PCP_STARTUP_SHA256`. With both absent, the loader returns immediately
+without reading or discovering a policy file, and the configured client keeps
+its existing ordinary arguments. A partial pair or an empty value is an error.
+
+The file is a canonical absolute path to a service-user-owned regular file with
+mode `0600`, no symbolic-link traversal, and at most 32 KiB. Its exact bytes must
+match the separately supplied lowercase SHA-256 pin. The host custody of that
+pin remains authoritative; changing the service-owned file cannot make new
+bytes acceptable at restart. Neither input contains a credential.
+
+Its only allowed top-level fields are `schema: "ea-matrix-pcp-startup-v1"`,
+`selection`, and optionally `initialBoundary`. The selection is exactly the
+existing PcpSyncSelection; the initial decision is exactly the explicit record
+described below. Unknown fields, invalid native identity, a mismatched decision
+or an attempted credential field reject. Parsing errors never print private
+file contents or filesystem payloads.
+
+This optional loader is limited to the existing retained single-client route:
+retained-read mode, the dedicated child process, and OAuth/token exchange off.
+The homeserver, user and device must match its retained launch environment.
+The existing configured-client helper freezes this input at module startup and
+checks each requested identity before passing it to the existing client
+factory. Headers cannot select a policy. A later environment/file change
+cannot attach or replace a binding on an already started process.
+
+The retained launcher's `--check` also validates explicit pinned input, using
+only the same saved-session/store metadata and private configuration. It does
+not open a queue, read/adopt the current cursor, create PCP tables, contact
+Matrix/PCP or start a publisher. Applicability of an initial decision to the
+actual checkpoint remains the transactional check at client startup.
+
+The currently installed five-key VPS bootstrap forwards neither input. Its
+existing behavior therefore stays fully inactive. A separate reviewed host
+forwarding/configuration change must supply the pinned, already-approved
+selection and decision. This source does not create that private file, choose
+its contents, add an authorization or change the live bootstrap.
+
 ### Explicit start after an existing legacy cursor
 
 An existing direct collector has no PCP custody for the history before its
@@ -79,8 +119,9 @@ audit metadata; it does not grant source access or approve its own application.
 
 The host integration can supply this record as `MatrixClientConfig.pcpSyncStart`
 alongside the separately authorized `pcpSync` selection **before creating the
-existing single client**. No environment loader or live configuration is added
-here. A record without its selection, a changed selection/cursor, an unexpected
+existing single client**. The private loader forwards only an explicitly
+supplied record; it never generates one from a cursor. A record without its
+selection, a changed selection/cursor, an unexpected
 field or coverage claim, a missing legacy cursor, or orphaned PCP custody is
 refused. It cannot attach to a running client with a different initial decision.
 
