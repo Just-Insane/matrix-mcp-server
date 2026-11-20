@@ -50,7 +50,12 @@ A selection cannot be attached to an already running unbound client or replace
 a different pending selection. Ordinary callers may reuse the bound client.
 A database with retained responsibility cannot silently omit or replace its
 selection on restart. A standalone legacy cursor cannot seed a new retention
-boundary without an explicit custody decision.
+boundary: binding refuses it before writing PCP tables or the selection key.
+Each resumed checkpoint must match the last committed retained batch. This
+source does not add a legacy-cursor adoption interface; any initial custody
+decision for an existing live cursor remains a separate rollout prerequisite.
+The early saved-selection check opens an existing database read-only and does
+not create a missing queue or initialize schema during ordinary client login.
 
 The receiver supplies Storage Only policy. This path grants no Search, Graph,
 Attention, model use or destination processing.

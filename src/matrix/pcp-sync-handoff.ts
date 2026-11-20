@@ -54,6 +54,9 @@ export class PcpSyncHandoff {
       if (existing && existing.value !== canonicalJson(this.selection)) {
         throw new Error("Matrix PCP selection cannot replace retained responsibility");
       }
+      if (!existing && db.prepare("SELECT 1 FROM sync_state WHERE key='sync_token'").get()) {
+        throw new Error("A legacy Matrix cursor cannot seed PCP retention without a retained boundary");
+      }
       db.exec(`
         CREATE TABLE IF NOT EXISTS pcp_matrix_sync_batches (
           id TEXT PRIMARY KEY, since_token TEXT, next_token TEXT NOT NULL,
@@ -84,6 +87,11 @@ export class PcpSyncHandoff {
     this.assertBinding();
     const row = this.db.prepare("SELECT value FROM sync_state WHERE key='sync_token'").get() as
       { value: string } | undefined;
+    const batch = this.db.prepare("SELECT next_token FROM pcp_matrix_sync_batches ORDER BY rowid DESC LIMIT 1")
+      .get() as { next_token: string } | undefined;
+    if ((row?.value ?? null) !== (batch?.next_token ?? null)) {
+      throw new Error("Matrix PCP checkpoint has no matching retained batch");
+    }
     return row?.value ?? null;
   }
 

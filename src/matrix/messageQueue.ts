@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import path from "path";
-import { mkdirSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
 import { EventEmitter } from "events";
 import { isRetainedReadMode } from "./retained-session.js";
 import { PCP_SELECTION_KEY, PcpSyncHandoff } from "./pcp-sync-handoff.js";
@@ -304,11 +304,7 @@ export class MessageQueue extends EventEmitter {
   }
 
   assertPcpSelection(selection?: PcpSyncSelection): void {
-    const row = this.db.prepare("SELECT value FROM sync_state WHERE key=?")
-      .get(PCP_SELECTION_KEY) as { value: string } | undefined;
-    if (row && (!selection || row.value !== canonicalJson(freezeSelection(selection)))) {
-      throw new Error("Retained Matrix PCP responsibility requires its fixed selection");
-    }
+    assertSavedPcpSelection(this.db, selection);
   }
 
   pcpHandoff(selection: PcpSyncSelection): PcpSyncHandoff {
@@ -395,6 +391,27 @@ export class MessageQueue extends EventEmitter {
 
 // Singleton
 let instance: MessageQueue | null = null;
+
+function assertSavedPcpSelection(db: Database.Database, selection?: PcpSyncSelection): void {
+  const row = db.prepare("SELECT value FROM sync_state WHERE key=?")
+    .get(PCP_SELECTION_KEY) as { value: string } | undefined;
+  if (row && (!selection || row.value !== canonicalJson(freezeSelection(selection)))) {
+    throw new Error("Retained Matrix PCP responsibility requires its fixed selection");
+  }
+}
+
+/** Check only saved binding metadata before client acquisition. Do not create a
+ * queue or initialize its schema on the ordinary disabled startup path. */
+export function assertRetainedPcpSelection(selection?: PcpSyncSelection, databasePath = DB_PATH): void {
+  if (databasePath === DB_PATH && instance) return instance.assertPcpSelection(selection);
+  if (!existsSync(databasePath)) return;
+  const db = new Database(databasePath, { readonly: true, fileMustExist: true });
+  try {
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_state'").get()) {
+      assertSavedPcpSelection(db, selection);
+    }
+  } finally { db.close(); }
+}
 
 export function getMessageQueue(): MessageQueue {
   if (!instance) {
