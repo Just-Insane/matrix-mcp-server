@@ -6,6 +6,7 @@ import { digest, freezeSelection, type PcpSyncSelection } from "./pcp-sync-obser
 export interface PcpStartup {
   selection: PcpSyncSelection;
   initialBoundary?: PcpLegacyStart;
+  receiverBinding?: { clientId: string; clientSecret: string };
 }
 const MAX_STARTUP_BYTES = 32 * 1024;
 
@@ -49,18 +50,30 @@ export function loadPcpStartup(env: NodeJS.ProcessEnv = process.env): PcpStartup
   if (digest(bytes) !== expected) throw new Error("Matrix PCP startup file differs from its exact digest pin");
   try {
     const value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    const publisher = value?.schema === "ea-matrix-pcp-startup-v2";
+    const keys = ["schema", "selection", ...(Object.hasOwn(value ?? {}, "initialBoundary") ? ["initialBoundary"] : []),
+      ...(publisher ? ["receiverBinding"] : [])];
     if (!value || typeof value !== "object" || Array.isArray(value) ||
-        value.schema !== "ea-matrix-pcp-startup-v1" ||
-        Object.keys(value).sort().join() !== (Object.hasOwn(value, "initialBoundary")
-          ? ["schema", "selection", "initialBoundary"] : ["schema", "selection"]).sort().join()) {
+        !["ea-matrix-pcp-startup-v1", "ea-matrix-pcp-startup-v2"].includes(value.schema) ||
+        Object.keys(value).sort().join() !== keys.sort().join()) {
       throw new Error();
     }
     const selection = freezeSelection(value.selection);
     const initialBoundary = Object.hasOwn(value, "initialBoundary")
       ? freezePcpLegacyStart(value.initialBoundary, selection) : undefined;
+    let receiverBinding: PcpStartup["receiverBinding"];
+    if (publisher) {
+      const binding = value.receiverBinding;
+      if (selection.policy.schema !== "ea-chat-source-v2" || !binding || typeof binding !== "object" || Array.isArray(binding) ||
+          Object.keys(binding).sort().join() !== "clientId,clientSecret" ||
+          ![binding.clientId, binding.clientSecret].every(text => typeof text === "string" && text.length > 0 &&
+            text.length <= 2048 && !/[\u0000-\u001f\u007f]/.test(text)) ||
+          selection.policy.principal !== "service:" + binding.clientId) throw new Error();
+      receiverBinding = Object.freeze({ clientId: binding.clientId, clientSecret: binding.clientSecret });
+    }
     assertNativeSelection(selection, { homeserverUrl: env.MATRIX_HOMESERVER_URL ?? "",
       userId: env.MATRIX_USER_ID ?? null, deviceId: env.MATRIX_DEVICE_ID ?? null });
-    return Object.freeze({ selection, ...(initialBoundary ? { initialBoundary } : {}) });
+    return Object.freeze({ selection, ...(initialBoundary ? { initialBoundary } : {}), ...(receiverBinding ? { receiverBinding } : {}) });
   } catch {
     throw new Error("Matrix PCP startup fixed selection, native identity or initial boundary is invalid");
   }

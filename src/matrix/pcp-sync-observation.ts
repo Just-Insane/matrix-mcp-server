@@ -17,22 +17,46 @@ const text = (value: unknown, max = 256): value is string =>
 
 /** The receiver policy is supplied by the approved host binding, never a room
  * event, display name, caller header or bridge heuristic. No bridge is claimed. */
+export type AcquisitionMode = "live" | "historical";
+interface PcpPolicy {
+  source: "matrix";
+  account: string;
+  profile: string;
+  principal: string;
+  policy_version: string;
+  basis: string;
+}
 export interface PcpSyncSelection {
   homeserverUrl: string;
   userId: string;
   deviceId: string;
   receiverUrl: string;
-  policy: {
+  policy: PcpPolicy & ({
     schema: "ea-chat-source-v1";
-    source: "matrix";
-    account: string;
-    profile: string;
     room: string;
-    principal: string;
-    policy_version: string;
-    mode: "live" | "historical";
-    basis: string;
-  };
+    mode: AcquisitionMode;
+  } | {
+    schema: "ea-chat-source-v2";
+    room_scope: "all_joined";
+    mode: "live_and_historical";
+  });
+}
+
+export const allJoinedSelection = (selection: PcpSyncSelection): boolean =>
+  selection.policy.schema === "ea-chat-source-v2";
+export const nativeRoomId = (room: unknown): room is string => text(room) && room.startsWith("!");
+export function publicationContext(value: unknown, selection: PcpSyncSelection): { room: string; mode: AcquisitionMode } {
+  if (!object(value) || !object(value.observation) || !nativeRoomId(value.observation.room_id)) {
+    throw new Error("Invalid frozen Matrix publication context");
+  }
+  const room = value.observation.room_id;
+  if (selection.policy.schema === "ea-chat-source-v1") {
+    if (room !== selection.policy.room || value.acquisition !== undefined) throw new Error("Matrix publication scope differs");
+    return { room, mode: selection.policy.mode };
+  }
+  if (!object(value.acquisition) || Object.keys(value.acquisition).join() !== "mode" ||
+      !["live", "historical"].includes(String(value.acquisition.mode))) throw new Error("Invalid Matrix acquisition lane");
+  return { room, mode: value.acquisition.mode as AcquisitionMode };
 }
 
 export function freezeSelection(input: PcpSyncSelection): PcpSyncSelection {
@@ -41,12 +65,16 @@ export function freezeSelection(input: PcpSyncSelection): PcpSyncSelection {
   const exact = (v: unknown, keys: string[]) => object(v) &&
     Object.keys(v).sort().join() === keys.sort().join();
   if (!exact(value, ["homeserverUrl", "userId", "deviceId", "receiverUrl", "policy"]) ||
-      !exact(policy, ["schema", "source", "account", "profile", "room", "principal",
-        "policy_version", "mode", "basis"]) || policy.schema !== "ea-chat-source-v1" ||
-      policy.source !== "matrix" || !["live", "historical"].includes(policy.mode) ||
-      !["account", "profile", "room", "principal", "policy_version", "basis"]
+      !(policy?.schema === "ea-chat-source-v1"
+        ? exact(policy, ["schema", "source", "account", "profile", "room", "principal", "policy_version", "mode", "basis"]) &&
+          ["live", "historical"].includes(policy.mode) && nativeRoomId(policy.room)
+        : policy?.schema === "ea-chat-source-v2" &&
+          exact(policy, ["schema", "source", "account", "profile", "room_scope", "principal", "policy_version", "mode", "basis"]) &&
+          policy.room_scope === "all_joined" && policy.mode === "live_and_historical") ||
+      policy.source !== "matrix" ||
+      !["account", "profile", "principal", "policy_version", "basis"]
         .every(key => text(policy[key])) ||
-      !policy.principal.startsWith("service:") || !policy.room.startsWith("!") ||
+      !policy.principal.startsWith("service:") ||
       !text(value.userId) || !value.userId.startsWith("@") || !text(value.deviceId)) {
     throw new Error("Invalid fixed Matrix PCP selection");
   }
@@ -65,6 +93,8 @@ export function freezeSelection(input: PcpSyncSelection): PcpSyncSelection {
 }
 
 export interface SelectedObservation {
+  roomId: string;
+  mode: AcquisitionMode;
   eventId: string | null;
   wire: Buffer;
   wireSha256: string;
@@ -80,7 +110,7 @@ export interface SelectedObservation {
 export interface SelectedSync {
   nextBatch: string;
   items: SelectedObservation[];
-  coverage: { section: string; gaps: string[]; prevBatch: string | null }[];
+  coverage: { roomId: string | null; section: string; gaps: string[]; prevBatch: string | null; lastEventId: string | null }[];
 }
 
 /** Strict JSON span parsing retains the selected event's exact UTF-8 spelling.
@@ -145,10 +175,11 @@ function parseSpans(bytes: Buffer): { value: Json; elements: WeakMap<object, [nu
 
 function prepareObservation(
   selection: PcpSyncSelection, raw: Json, wire: Buffer, section: string,
-  stream: string, ordinal: number, observedAt: string, batchGaps: string[],
+  stream: string, ordinal: number, observedAt: string, batchGaps: string[], roomId: string, mode: AcquisitionMode,
 ): SelectedObservation {
   const gaps = [...batchGaps, "upstream_history_unverified"];
   const result: SelectedObservation = {
+    roomId, mode,
     eventId: object(raw) && text(raw.event_id) ? raw.event_id : null,
     wire, wireSha256: digest(wire), section, stream, ordinal,
     publication: null, query: null, queryDigest: null, targetEventId: null, gaps,
@@ -156,7 +187,7 @@ function prepareObservation(
   if (!object(raw) || !result.eventId || !result.eventId.startsWith("$")) {
     gaps.push("native_event_identity_unavailable"); return result;
   }
-  if (raw.room_id !== undefined && raw.room_id !== selection.policy.room) {
+  if (raw.room_id !== undefined && raw.room_id !== roomId) {
     gaps.push("native_room_mismatch"); return result;
   }
   const content = object(raw.content) ? raw.content : {};
@@ -173,7 +204,8 @@ function prepareObservation(
     gaps.push("lifecycle_contract_pending"); return result;
   }
   if (!["m.room.message", "m.room.encrypted"].includes(String(raw.type)) || stream !== "timeline") {
-    gaps.push("non_message_observation"); return result;
+    gaps.push("non_message_observation");
+    if (!allJoinedSelection(selection)) return result;
   }
   const encrypted = raw.type === "m.room.encrypted";
   if (encrypted) gaps.push("decryption_unavailable", "attachment_inventory_unavailable");
@@ -184,8 +216,8 @@ function prepareObservation(
     .filter((value): value is string => text(value, 2048)))];
   if (locators.length) gaps.push("attachment_bytes_unavailable");
   // Adding the enclosing room to the raw envelope is an explicit transformation.
-  const fidelity = raw.room_id === selection.policy.room ? "original" : "transformed";
-  const providerRaw = fidelity === "original" ? raw : { ...raw, room_id: selection.policy.room };
+  const fidelity = raw.room_id === roomId ? "original" : "transformed";
+  const providerRaw = fidelity === "original" ? raw : { ...raw, room_id: roomId };
   let time = typeof raw.origin_server_ts === "number" && Number.isSafeInteger(raw.origin_server_ts)
     && Math.abs(raw.origin_server_ts) <= 8_640_000_000_000_000
     ? new Date(raw.origin_server_ts).toISOString() : null;
@@ -193,7 +225,7 @@ function prepareObservation(
   if (time === null) gaps.push("native_event_time_unavailable");
   const observation = {
     schema: "matrix-discord-observation/v1", source: "matrix", account: selection.policy.account,
-    room_id: selection.policy.room, event_id: result.eventId,
+    room_id: roomId, event_id: result.eventId,
     thread_id: ["m.thread", "io.element.thread"].includes(String(relation.rel_type)) &&
       text(relation.event_id, 2048) ? relation.event_id : null,
     observed_at: observedAt, event_time: time, raw: providerRaw,
@@ -213,6 +245,7 @@ function prepareObservation(
   };
   result.publication = JSON.stringify({
     observation, ...(fidelity === "original" ? { provider_bytes: wire.toString("base64") } : {}),
+    ...(allJoinedSelection(selection) ? { acquisition: { mode } } : {}),
   });
   if (Buffer.byteLength(result.publication) > 2_000_000) {
     result.publication = null;
@@ -224,7 +257,8 @@ function prepareObservation(
   return result;
 }
 
-export function selectSync(bytes: Buffer, selection: PcpSyncSelection, observedAt: string): SelectedSync {
+export function selectSync(bytes: Buffer, selection: PcpSyncSelection, observedAt: string,
+  previouslyJoined: ReadonlySet<string> = new Set()): SelectedSync {
   if (!/^\d{4}-\d{2}-\d{2}T.+(?:Z|[+-]\d{2}:\d{2})$/.test(observedAt) ||
       !Number.isFinite(Date.parse(observedAt))) throw new Error("Invalid Matrix observation clock");
   const { value, elements, source } = parseSpans(bytes);
@@ -234,7 +268,8 @@ export function selectSync(bytes: Buffer, selection: PcpSyncSelection, observedA
   const rooms = object(value.rooms) ? value.rooms : {};
   const sections = ["join", "leave", "invite", "knock"];
   for (const [section, group] of Object.entries(rooms)) {
-    if (!sections.includes(section) && object(group) && group[selection.policy.room] !== undefined) {
+    if (!sections.includes(section) && object(group) && (allJoinedSelection(selection) ||
+        group[(selection.policy as { room: string }).room] !== undefined)) {
       throw new Error("Unsupported selected Matrix room section");
     }
   }
@@ -242,30 +277,65 @@ export function selectSync(bytes: Buffer, selection: PcpSyncSelection, observedA
     const group = rooms[section];
     if (group === undefined) continue;
     if (!object(group)) throw new Error("Invalid Matrix room group");
-    const room = group[selection.policy.room];
-    if (room === undefined) continue;
-    if (!object(room)) throw new Error("Invalid selected Matrix room");
-    const timeline = object(room.timeline) ? room.timeline : {};
-    const gaps = timeline.limited === true ? ["timeline_limited"] : [];
-    result.coverage.push({
-      section, gaps: [...gaps, "upstream_history_unverified"],
-      prevBatch: text(timeline.prev_batch, 16_384) ? timeline.prev_batch : null,
-    });
-    for (const stream of ["timeline", "state", "invite_state", "knock_state", "org.matrix.msc4222.state_after"]) {
-      const container = room[stream];
-      if (container === undefined) continue;
-      if (!object(container) || !Array.isArray(container.events)) throw new Error("Unenumerable selected Matrix events");
-      const events = container.events;
-      events.forEach((raw, ordinal) => {
-        const span = elements.get(events)?.[ordinal];
-        if (!span) throw new Error("Selected Matrix event span unavailable");
-        const wire = Buffer.from(source.slice(...span), "utf8");
-        result.items.push(prepareObservation(selection, raw, wire, section, stream, ordinal, observedAt, gaps));
+    const selectedRooms = selection.policy.schema === "ea-chat-source-v1" ? [selection.policy.room]
+      : section === "join" ? Object.keys(group) : section === "leave"
+        ? Object.keys(group).filter(room => previouslyJoined.has(room)) : [];
+    for (const roomId of selectedRooms) {
+      const room = group[roomId];
+      if (room === undefined) continue;
+      if (!nativeRoomId(roomId) || !object(room)) throw new Error("Invalid selected Matrix room");
+      const timeline = object(room.timeline) ? room.timeline : {};
+      const gaps = timeline.limited === true ? ["timeline_limited"] : [];
+      const events = Array.isArray(timeline.events) ? timeline.events : [];
+      const last = events.at(-1);
+      result.coverage.push({
+        roomId, section, gaps: [...gaps, "upstream_history_unverified"],
+        prevBatch: text(timeline.prev_batch, 16_384) ? timeline.prev_batch : null,
+        lastEventId: object(last) && text(last.event_id) ? last.event_id : null,
       });
+      for (const stream of ["timeline", "state", "invite_state", "knock_state", "org.matrix.msc4222.state_after"]) {
+        const container = room[stream];
+        if (container === undefined) continue;
+        if (!object(container) || !Array.isArray(container.events)) throw new Error("Unenumerable selected Matrix events");
+        const events = container.events;
+        events.forEach((raw, ordinal) => {
+          const span = elements.get(events)?.[ordinal];
+          if (!span) throw new Error("Selected Matrix event span unavailable");
+          const wire = Buffer.from(source.slice(...span), "utf8");
+          result.items.push(prepareObservation(selection, raw, wire, section, stream, ordinal, observedAt, gaps,
+            roomId, selection.policy.schema === "ea-chat-source-v1" ? selection.policy.mode : "live"));
+        });
+      }
     }
   }
   if (!result.coverage.length) result.coverage.push({
-    section: "unobserved", gaps: ["selected_room_not_observed", "upstream_history_unverified"], prevBatch: null,
+    roomId: null, section: "unobserved", gaps: ["selected_room_not_observed", "upstream_history_unverified"], prevBatch: null, lastEventId: null,
   });
   return result;
+}
+
+/** Native /messages pages have an independent per-room continuation. Exact
+ * event spellings are retained before that continuation can advance; an empty
+ * page with an end token is not completion. No SDK timeline cursor is used. */
+export function selectHistory(bytes: Buffer, selection: PcpSyncSelection, roomId: string,
+  observedAt: string): { items: SelectedObservation[]; next: string | null } {
+  if (!nativeRoomId(roomId) || !allJoinedSelection(selection)) throw new Error("Invalid Matrix history scope");
+  if (!/^\d{4}-\d{2}-\d{2}T.+(?:Z|[+-]\d{2}:\d{2})$/.test(observedAt) ||
+      !Number.isFinite(Date.parse(observedAt))) throw new Error("Invalid Matrix observation clock");
+  const { value, elements, source } = parseSpans(bytes);
+  if (!object(value) || !Array.isArray(value.chunk) ||
+      value.end !== undefined && !text(value.end, 16_384)) throw new Error("Invalid Matrix history page");
+  const items: SelectedObservation[] = [];
+  for (const stream of ["chunk", "state"]) {
+    const events = value[stream];
+    if (events === undefined) continue;
+    if (!Array.isArray(events)) throw new Error("Unenumerable Matrix history page");
+    events.forEach((raw, ordinal) => {
+      const span = elements.get(events)?.[ordinal];
+      if (!span) throw new Error("Matrix history event span unavailable");
+      items.push(prepareObservation(selection, raw, Buffer.from(source.slice(...span), "utf8"),
+        "history", stream === "chunk" ? "timeline" : "state", ordinal, observedAt, [], roomId, "historical"));
+    });
+  }
+  return { items, next: value.end as string | undefined ?? null };
 }

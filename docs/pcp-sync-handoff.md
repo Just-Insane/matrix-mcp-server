@@ -3,7 +3,8 @@
 This prepares the native collector responsibility in
 [PCP108](https://github.com/Just-Insane/personal-context-platform/issues/108).
 It is inactive by default. It does not install, restart, configure or activate
-the accepted direct connector, select a real room, grant access or add a timer.
+the accepted direct connector, select a real room or grant access. An explicitly
+pinned v2 startup enables the acquisition facet of the existing collector below.
 
 ## Retention before SDK consumption
 
@@ -13,8 +14,11 @@ and mutates event objects. A timeline callback or rendered queue receipt cannot
 establish original custody or prevent a missed acquisition.
 
 The optional MatrixClientConfig.pcpSync value binds one exact homeserver, user,
-device and fixed PCP receiver URL, plus the receiver's existing ea-chat-source-v1 policy: schema,
-source, account, profile, room, principal, policy_version, mode and basis.
+device and fixed PCP receiver URL. The existing ea-chat-source-v1 policy binds
+one room and one mode. The ea-chat-source-v2 policy retains source, account,
+profile, principal, policy_version and basis, with room_scope: all_joined and
+mode: live_and_historical. It enumerates only the retained account's joined rooms;
+it does not join a room or acquire a new provider grant.
 The authenticated client identity is checked before its first sync.
 
 The existing client remains the only sync client, and message-queue.db remains
@@ -44,7 +48,9 @@ responsibility or independently advance a checkpoint once retention is bound.
 The default application supplies no pcpSync value. The optional private loader
 below passes only an explicitly pinned host selection to the **existing single
 client creator before startup**. It reuses that queue's pcpHandoff(selection).
-No secret store, publisher process or schedule is added.
+No separate secret store, publisher process or host schedule is added. The v1
+startup remains retention-only. The v2 startup enables a bounded timer within
+the existing collector, with that collector's startup and stop lifetime.
 
 A selection cannot be attached to an already running unbound client or replace
 a different pending selection. Ordinary callers may reuse the bound client.
@@ -60,8 +66,8 @@ queues. When PCP owns the checkpoint, that mirror is a no-op: the SDK can lag a
 committed response, and its token cannot replace durable responsibility or crash
 the timer. Direct unretained checkpoint writes remain rejected.
 
-The receiver supplies Storage Only policy. This path grants no Search, Graph,
-Attention, model use or destination processing.
+The receiver's existing policy governs destination processing. Acquisition
+configuration does not grant Search, Graph, Attention or model permissions.
 
 ### Pinned private startup input
 
@@ -74,14 +80,22 @@ The file is a canonical absolute path to a service-user-owned regular file with
 mode `0600`, no symbolic-link traversal, and at most 32 KiB. Its exact bytes must
 match the separately supplied lowercase SHA-256 pin. The host custody of that
 pin remains authoritative; changing the service-owned file cannot make new
-bytes acceptable at restart. Neither input contains a credential.
+bytes acceptable at restart. The environment pair contains only a path and pin.
 
 Its only allowed top-level fields are `schema: "ea-matrix-pcp-startup-v1"`,
 `selection`, and optionally `initialBoundary`. The selection is exactly the
 existing PcpSyncSelection; the initial decision is exactly the explicit record
 described below. Unknown fields, invalid native identity, a mismatched decision
-or an attempted credential field reject. Parsing errors never print private
+or an attempted credential field in v1 reject. Parsing errors never print private
 file contents or filesystem payloads.
+
+The v2 envelope uses schema: ea-matrix-pcp-startup-v2 and adds receiverBinding
+with exactly clientId and clientSecret from the existing source Access credential.
+It requires the v2 all-joined selection and service principal matching clientId.
+This credential remains in the same protected, pinned private startup file and
+process memory; it is never written to the handoff database or public receipts.
+The host obtains it through its established protected BWS custody, without
+creating a credential, grant or secret-bearing command argument.
 
 This optional loader is limited to the existing retained single-client route:
 retained-read mode, the dedicated child process, and OAuth/token exchange off.
@@ -160,9 +174,9 @@ the room explicitly, omits provider_bytes and declares **transformed** fidelity.
 A wire envelope already containing the matching room is submitted as an exact
 original. SDK objects are never called wire bytes.
 
-Own-sender messages are retained. Encrypted payloads keep explicit decryption and
-attachment-inventory gaps. Attachment locators remain references with a
-missing-bytes gap; this publisher performs no decryption or attachment fetch.
+Own-sender messages are retained. The v1 helper keeps encrypted payloads and
+attachment references with explicit gaps. The v2 collector uses the existing
+SDK keys and captures available native media as described below.
 Healthy parents and siblings remain independently publishable. Upstream history
 is always unverified, limited windows are partial, and absent room coverage
 does not imply deletion.
@@ -206,6 +220,74 @@ gaps, or erase its originals. Later attachment custody, correction and erasure
 remain their own existing interfaces.
 
 ## Verification and rollout boundary
+
+### All joined rooms, full accessible history, live first
+
+`pcp-acquisition.ts` extends the existing collector; it creates no second Matrix
+client or sync consumer. Live `/sync` retains every joined room's native timeline
+and state event before advancing the existing checkpoint. Invitations and
+unjoined room contents are excluded. A departure preserves prior custody and
+continuations; rejoining resumes them. Native room/event identities remain
+separate from any claimed Discord bridge mapping.
+
+The collector enumerates the complete native joined-room list, including quiet
+rooms absent from resumed sync responses. Each room has a durable full-history
+job, and a limited live window adds a separate gap job tied to the last retained
+native event. Native backward `/messages` pages retain exact event spans and the
+next room continuation in one SQLite transaction. History never writes
+`sync_state.sync_token`. An empty page with an `end` token continues; only a
+missing `end`, or the exact known event bounding a gap job, closes that job.
+Repeated cursors remain stalled, and failures retain the previous continuation.
+The page limit is resumable and has no total-history cutoff.
+
+The single-flight collector turn runs every 30 seconds. It offers at most ten
+publications, selecting fresh live records between remote calls. At most two
+slots perform old receipt or enrichment recovery, so uncertain live work cannot
+permanently crowd out history. When no live publication waits, the turn acquires
+one native page of up to 100 events from a fair rotating history job. Acquisition
+pauses at 200 outstanding publications and resumes as custody drains. The source
+turn has a 45-second admission budget; individual reads retain their 15-second
+network/body deadline. Live sync continues independently of these awaited reads.
+The shared receiver retains its own live-first historical admission policy.
+
+The existing SDK crypto context can add `observation.decrypted_event` containing
+the exact room/event identity, original clear type and full original content.
+It never reads a bundled replacement as the original, restores a key backup,
+replaces a device or exports keys. Original ciphertext remains unchanged. Missing
+keys remain explicit and are retried by the same collector after five minutes.
+
+Available native MXC attachments are read through the authenticated homeserver,
+with redirects prohibited. A publication carries up to 16 MiB of media in a
+24 MiB JSON envelope; up to four native downloads are attempted per preparation.
+After an exact positive receipt, a later media batch or newly available plaintext
+uses the same native record and a monotonic rendition. The previous publication
+and receipt are archived before a different attempt is allowed. An uncertain
+publication is immutable and can only be reconciled, never blindly replayed.
+Existing acknowledged media is not downloaded or resent during later batches.
+
+Encrypted media is retained as exact ciphertext with a separate decryption gap;
+it is not relabelled as a decoded file. Unsupported external locators, files over
+16 MiB, missing keys, media failures, oversized native responses and unresolved
+edits/redactions remain explicit gaps. Every edit/redaction's raw bytes and target
+are retained as held obligations while the separate parent lifecycle contract is
+resolved. Healthy siblings continue. Page traversal completion is not publication,
+media, key or lifecycle completion; `coverage()` reports these outstanding work
+counts separately.
+
+For initial activation, deploy/configure the v2 receiver policy before enabling
+the native publisher. A bound read-only receipt probe must show the source route
+is available; starting a publisher against an absent policy would create durable
+uncertainty, not permission to replay. Stop the existing collector watcher and
+quiesce the exact provider before preparing the initial boundary from its current
+saved cursor. Preserve the current matched session, device, crypto, queue and
+private configuration. Build the reviewed immutable native revision, prepare the
+private v2 startup file, and set only the existing `pcp_startup_file` and
+`pcp_startup_sha256` host fields plus the release/revision pointer. Run the existing
+metadata-only retained startup check, then resume the same provider and watcher.
+Verify one client, saved-cursor resume, exact common receipts and durable per-room
+history progress. Once the boundary is committed, rollback requires a compatible
+retention-aware release and the latest state; do not erase a selection or rewind
+the cursor to make an older binary start.
 
 Focused tests use fabricated identities, payloads and credentials with temporary
 real SQLite databases. They exercise the locked SDK with fake fetch responses

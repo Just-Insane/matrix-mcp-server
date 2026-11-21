@@ -166,6 +166,14 @@ queue and sync cursor. This does not perform an initial sync or
 load every room's history. The native history/event tools can read an authorized
 room directly without requiring that cache.
 
+An explicitly pinned PCP v2 startup can extend that same retained collector to
+ingest all joined rooms and their full accessible history. Live sync and
+publication have priority; backward native history pages keep separate durable
+per-room continuations. The existing SDK keys and available native media are
+used without replacing the session or starting a second sync client. Missing
+keys, oversized media and unresolved lifecycle events remain visible gaps. See
+[the native PCP handoff and activation contract](docs/pcp-sync-handoff.md).
+
 ## End-to-End Encryption
 
 The server speaks E2EE natively. It uses a custom SQLite-backed IndexedDB adapter (`better-sqlite3`) to persist the [matrix-sdk-crypto](https://github.com/matrix-org/matrix-rust-sdk) state between restarts — no browser required.

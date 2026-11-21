@@ -6,6 +6,9 @@ import { assertNativeSelection } from "../matrix/pcp-sync-handoff.js";
 // Freeze one explicit host binding before any configured client is created.
 // Changing a file or environment later cannot attach a new selection to it.
 const pcpStartup = loadPcpStartup();
+/** The retained collector uses the already frozen host binding; tool headers
+ * or a later file/environment change cannot start a publisher. */
+export const getPcpPublisherStartup = () => pcpStartup?.receiverBinding ? pcpStartup : undefined;
 
 // Environment configuration
 export const ENABLE_OAUTH = process.env.ENABLE_OAUTH === "true";

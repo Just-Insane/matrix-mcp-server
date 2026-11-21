@@ -9,11 +9,13 @@
  * it left off — no duplicate messages after restart.
  */
 import { RoomEvent, MatrixEvent, MatrixEventEvent, EventType, ClientEvent, MatrixClient } from "matrix-js-sdk";
-import { createConfiguredMatrixClient, getAccessToken, getMatrixContext } from "../utils/server-helpers.js";
+import { createConfiguredMatrixClient, getAccessToken, getMatrixContext, getPcpPublisherStartup } from "../utils/server-helpers.js";
 import { getMessageQueue, QueuedMessage } from "./messageQueue.js";
 import { getCachedClient } from "./clientCache.js";
 import { readFileSync } from "fs";
 import path from "path";
+import { PcpReceiver } from "./pcp-publication.js";
+import { startPcpAcquisition } from "./pcp-acquisition.js";
 
 const DATA_DIR = process.env.MATRIX_DATA_DIR ?? path.join(process.cwd(), ".data");
 const KEEPALIVE_INTERVAL_MS = 5 * 60 * 1000;
@@ -22,6 +24,7 @@ const SYNC_CHECK_INTERVAL_MS = 3 * 60 * 1000;
 let running = false;
 let keepAliveHandle: ReturnType<typeof setInterval> | null = null;
 let syncCheckHandle: ReturnType<typeof setInterval> | null = null;
+let stopPcpAcquisition: (() => void) | null = null;
 
 /**
  * Build set of DM room IDs from m.direct account data + fallback heuristic.
@@ -250,10 +253,14 @@ export async function startAutoSync(): Promise<void> {
     }
   }, SYNC_CHECK_INTERVAL_MS);
 
+  const pcp = getPcpPublisherStartup();
+  if (pcp?.receiverBinding) stopPcpAcquisition = startPcpAcquisition(client,
+    queue.pcpHandoff(pcp.selection, pcp.initialBoundary), new PcpReceiver(pcp.selection, pcp.receiverBinding));
   console.error("[autoSync] Ready — listening for events");
 }
 
 export function stopAutoSync(): void {
+  stopPcpAcquisition?.(); stopPcpAcquisition = null;
   if (keepAliveHandle) { clearInterval(keepAliveHandle); keepAliveHandle = null; }
   if (syncCheckHandle) { clearInterval(syncCheckHandle); syncCheckHandle = null; }
   running = false;
