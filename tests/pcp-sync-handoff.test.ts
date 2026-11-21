@@ -61,7 +61,7 @@ function positive(h: ReturnType<typeof fixture>, id: string) {
   const query = JSON.parse(frozen.query), item = canonicalJson([selection.policy.profile, selection.policy.room, query.event_id]);
   const record = "ea-record:source-v2:" + digest(JSON.stringify(["matrix", selection.policy.account, item]));
   const revision = "source:" + digest(JSON.stringify(["matrix", selection.policy.account, item, "sha256:" + query.native_sha256]));
-  const representation = "ea-rep:" + "a".repeat(64);
+  const representation = "sha256:" + "a".repeat(64);
   return {
     status: "captured", read_only: true, replay_authorized: false, query_digest: frozen.queryDigest,
     capture_id: "ea-capture:" + digest(JSON.stringify(["ea-intake-v1", record, revision])),
@@ -384,6 +384,8 @@ test("only the exact positive read receipt can discharge; corrupt frozen custody
     { ...good, status: "absent" }, { ...good, read_only: false }, { ...good, replay_authorized: true },
     { ...good, query_digest: "0".repeat(64) }, { ...good, capture_id: "wrong" },
     { ...good, attachments: [{ locator_sha256: "0".repeat(64), sha256: "0".repeat(64) }] },
+    { ...good, recordReference: { ...good.recordReference,
+      representation_id: "ea-rep:" + good.recordReference.representation_id.slice(7) } },
     ...["record_id", "revision_id", "representation_id", "record_ref", "lifecycle_version"].map(field =>
       ({ ...good, recordReference: { ...good.recordReference, [field]: "wrong" } })),
   ];

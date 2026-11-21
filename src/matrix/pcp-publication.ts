@@ -48,7 +48,7 @@ export function exactPositiveReceipt(
     const revision = "source:" + digest(JSON.stringify(["matrix", selection.policy.account, item, "sha256:" + query.native_sha256]));
     const capture = "ea-capture:" + digest(JSON.stringify(["ea-intake-v1", record, revision]));
     const ref = receipt.recordReference;
-    if (!object(ref) || !text(ref.representation_id) || !/^ea-rep:[a-f0-9]{64}$/.test(ref.representation_id)) return false;
+    if (!object(ref) || !text(ref.representation_id) || !/^sha256:[a-f0-9]{64}$/.test(ref.representation_id)) return false;
     const expectedRef = "r2://ea-raw/sources/common/v2/" + digest(canonicalJson([record, revision])) +
       "/representations/" + ref.representation_id.slice(7) + ".json";
     return receipt.status === "captured" && receipt.read_only === true && receipt.replay_authorized === false &&
