@@ -1,23 +1,26 @@
 import fetch from "node-fetch";
 import type { Readable } from "node:stream";
 import type { MatrixClient } from "matrix-js-sdk";
-import { assertNativeSelection, MAX_SYNC_BYTES, type PcpSyncHandoff, type PcpHistoryWork } from "./pcp-sync-handoff.js";
-import { allJoinedSelection, canonicalJson, digest, object, publicationContext } from "./pcp-sync-observation.js";
+import { assertNativeSelection, MAX_SYNC_BYTES, MAX_SNAPSHOT_BYTES, type PcpSyncHandoff, type PcpHistoryWork } from "./pcp-sync-handoff.js";
+import { allJoinedSelection, canonicalJson, digest, object, publicationContext, observationItemId } from "./pcp-sync-observation.js";
 import { PcpReceiver, publishPcpObservation } from "./pcp-publication.js";
 import { boundedRequestSignal } from "./request-signal.js";
+import { PcpMediaTransfers, decryptedMediaLocator, type MediaInfo, type MediaContext, type PreparedMedia, type MediaOriginal } from "./pcp-media.js";
 
 const MEDIA_BYTES = 16 * 1024 * 1024;
 const ACQUISITION_GAPS = new Set(["decryption_unavailable", "attachment_inventory_unavailable", "attachment_bytes_unavailable",
-  "attachment_size_limit", "attachment_locator_unsupported", "attachment_download_unavailable", "attachment_decryption_unavailable"]);
+  "attachment_size_limit", "attachment_platform_size_limit", "attachment_locator_unsupported", "attachment_download_unavailable", "attachment_decryption_unavailable"]);
 export type AcquisitionClient = Pick<MatrixClient, "getJoinedRooms" | "getUserId" | "getDeviceId" | "getHomeserverUrl" |
   "getAccessToken" | "getEventMapper" | "decryptEventIfNeeded" | "mxcUrlToHttp" | "getSyncState">;
 class NativeReadUnavailable extends Error {
   constructor(readonly status: number) { super("Matrix native read unavailable"); }
 }
 
-/** Read-only requests using the same retained native identity. No /sync call,
- * SDK timeline mutation, cursor reset, key restore, membership or new client. */
+/** Read-only requests using the same retained native identity. An initial
+ * inventory snapshot is independent of the one live /sync cursor and never
+ * enters the SDK. No timeline mutation, key restore, membership or new client. */
 export class PcpNativeReader {
+  private mediaTransfers?: PcpMediaTransfers;
   constructor(private readonly client: AcquisitionClient, private readonly handoff: PcpSyncHandoff,
     private readonly fetchFn: typeof fetch = fetch) {
     assertNativeSelection(handoff.selection, { homeserverUrl: client.getHomeserverUrl(),
@@ -51,21 +54,61 @@ export class PcpNativeReader {
   }
 
   history(work: PcpHistoryWork): Promise<Buffer> {
-    const url = new URL("/_matrix/client/v3/rooms/" + encodeURIComponent(work.room_id) + "/messages", this.handoff.selection.homeserverUrl);
+    const url = new URL("/_matrix/client/v3/rooms/" + encodeURIComponent(work.room_id) + (work.kind === "state" ? "/state" : "/messages"), this.handoff.selection.homeserverUrl);
+    if (work.kind === "state") return this.bytes(url, MAX_SNAPSHOT_BYTES);
     url.searchParams.set("dir", "b"); url.searchParams.set("limit", "100");
     if (work.next_token !== null) url.searchParams.set("from", work.next_token);
     return this.bytes(url, MAX_SYNC_BYTES);
   }
 
-  async media(locator: string): Promise<Buffer> {
-    // External content URLs remain references. Native MXC downloads stay on the
-    // authenticated homeserver and cannot redirect credentials to an event URL.
+  accessibleInventory(): Promise<Buffer> {
+    const url = new URL("/_matrix/client/v3/sync", this.handoff.selection.homeserverUrl);
+    url.searchParams.set("timeout", "0");
+    url.searchParams.set("filter", JSON.stringify({ room: { include_leave: true, timeline: { limit: 1 },
+      state: { lazy_load_members: true }, ephemeral: { types: [] }, account_data: { types: [] } },
+      presence: { types: [] }, account_data: { types: [] } }));
+    // This bounded inventory avoids one huge repeated member list. Separate
+    // /state jobs retain the full accessible state, including every member.
+    return this.bytes(url, MAX_SNAPSHOT_BYTES);
+  }
+
+  async preparedMedia(context: MediaContext, info: MediaInfo, receiver: PcpReceiver): Promise<PreparedMedia> {
+    if (receiver.selectionDigest !== this.handoff.selectionDigest) throw new Error("Matrix media receiver differs");
+    const root = this.handoff.mediaSpoolDirectory();
+    if (!root) return { parts: [], pending: true, gaps: ["attachment_bytes_unavailable"] };
+    this.mediaTransfers ??= new PcpMediaTransfers(root, this.handoff.selectionDigest,
+      async (locator, signal) => {
+        const url = this.mediaUrl(locator), token = this.client.getAccessToken();
+        if (!token) throw new Error("Retained Matrix credential unavailable");
+        const read = () => this.fetchFn(url, { method: "GET", redirect: "error", signal,
+          headers: { Authorization: "Bearer " + token } });
+        let response = await read();
+        if ([404, 405].includes(response.status)) {
+          (response.body as Readable | null)?.destroy(); url.pathname = url.pathname.replace("/_matrix/client/v1/media/download/", "/_matrix/media/v3/download/");
+          response = await read();
+        }
+        return response;
+      }, (context, locator, file, signal, canContinue) => receiver.uploadOriginal(context, locator, file, signal, canContinue),
+      () => !this.handoff.hasLiveReady());
+    return this.mediaTransfers.prepare(context, info);
+  }
+
+  stopMedia(): void { this.mediaTransfers?.stop(); }
+
+  private mediaUrl(locator: string): URL {
     if (!locator.startsWith("mxc://")) throw new Error("Unsupported Matrix media locator");
     const candidate = this.client.mxcUrlToHttp(locator, undefined, undefined, undefined, false, false, true);
     if (!candidate) throw new Error("Unsupported Matrix media locator");
     const url = new URL(candidate);
-    if (!url.pathname.startsWith("/_matrix/client/v1/media/download/")) throw new Error("Unsupported authenticated Matrix media route");
-    url.searchParams.set("allow_redirect", "false");
+    if (url.origin !== this.handoff.selection.homeserverUrl || url.username || url.password || url.hash ||
+        !url.pathname.startsWith("/_matrix/client/v1/media/download/")) throw new Error("Unsupported authenticated Matrix homeserver media route");
+    url.searchParams.set("allow_redirect", "false"); return url;
+  }
+
+  async media(locator: string): Promise<Buffer> {
+    // External content URLs remain references. Native MXC downloads stay on the
+    // authenticated homeserver and cannot redirect credentials to an event URL.
+    const url = this.mediaUrl(locator);
     try { return await this.bytes(url, MEDIA_BYTES); }
     catch (error) {
       if (!(error instanceof NativeReadUnavailable) || ![404, 405].includes(error.status)) throw error;
@@ -77,20 +120,26 @@ export class PcpNativeReader {
   }
 }
 
-function mediaInventory(content: any): { locator: string; encrypted: boolean; expectedDigest: string | null; expectedSize: number | null }[] {
-  const candidates = [
-    { locator: content?.url, file: null, size: content?.info?.size },
-    { locator: content?.file?.url, file: content?.file, size: content?.info?.size },
-    { locator: content?.info?.thumbnail_url, file: null, size: content?.info?.thumbnail_info?.size },
-    { locator: content?.info?.thumbnail_file?.url, file: content?.info?.thumbnail_file, size: content?.info?.thumbnail_info?.size },
-  ];
+function mediaInventory(content: any): MediaInfo[] {
+  const candidates: { locator: any; file: any; size: any; mediaType: any }[] = [];
+  const visit = (value: any, depth = 0) => {
+    if (!value || typeof value !== "object" || depth > 64) return;
+    if (typeof value.url === "string") candidates.push({ locator: value.url,
+      file: value.key && value.iv ? value : null, size: value.info?.size, mediaType: value.info?.mimetype });
+    if (value.file?.url) candidates.push({ locator: value.file.url, file: value.file, size: value.info?.size, mediaType: value.info?.mimetype });
+    if (value.thumbnail_url) candidates.push({ locator: value.thumbnail_url, file: null, size: value.thumbnail_info?.size, mediaType: value.thumbnail_info?.mimetype });
+    if (value.thumbnail_file?.url) candidates.push({ locator: value.thumbnail_file.url, file: value.thumbnail_file, size: value.thumbnail_info?.size, mediaType: value.thumbnail_info?.mimetype });
+    for (const [key, child] of Object.entries(value)) if (!["file", "thumbnail_file"].includes(key)) visit(child, depth + 1);
+  };
+  visit(content);
   const result = new Map<string, ReturnType<typeof mediaInventory>[number]>();
   for (const entry of candidates) if (typeof entry.locator === "string" && entry.locator.length && entry.locator.length <= 2048) {
     const hash = entry.file?.hashes?.sha256;
     const decoded = typeof hash === "string" ? Buffer.from(hash, "base64") : null;
     result.set(entry.locator, { locator: entry.locator, encrypted: !!entry.file,
       expectedDigest: decoded?.length === 32 ? decoded.toString("hex") : null,
-      expectedSize: Number.isSafeInteger(entry.size) && entry.size >= 0 ? entry.size : null });
+      expectedSize: Number.isSafeInteger(entry.size) && entry.size >= 0 ? entry.size : null,
+      file: entry.file, mediaType: entry.mediaType });
   }
   return [...result.values()];
 }
@@ -100,7 +149,7 @@ function mediaInventory(content: any): { locator: string; encrypted: boolean; ex
  * Partial key/media availability leaves a durable retry and the full original
  * independently publishable. Exact ciphertext media is never relabelled clear. */
 export async function preparePcpPublication(handoff: PcpSyncHandoff, id: string, client: AcquisitionClient,
-  reader: Pick<PcpNativeReader, "media">, now = Date.now()): Promise<void> {
+  reader: Pick<PcpNativeReader, "media"> & Partial<Pick<PcpNativeReader, "preparedMedia">>, now = Date.now(), receiver?: PcpReceiver): Promise<void> {
   const state = handoff.state(id), frozen = handoff.publication(id);
   if (!frozen || state !== "ready" && state !== "acknowledged") return;
   const before = JSON.parse(frozen.body), body = JSON.parse(frozen.body), observation = body.observation;
@@ -148,16 +197,36 @@ export async function preparePcpPublication(handoff: PcpSyncHandoff, id: string,
     observation.attachments.push({ locator: item.locator, custody: "reference" }); known.add(item.locator);
   }
   const published = handoff.publishedAttachments(id);
-  const attachments: { locator: string; base64: string; sha256: string }[] = state === "ready" ? body.attachments ?? [] : [];
-  let bytes = attachments.reduce((total, item) => total + Buffer.from(item.base64, "base64").length, 0);
+  const attachments: { locator: string; base64?: string; sha256: string; original?: MediaOriginal }[] = state === "ready" ? body.attachments ?? [] : [];
+  let bytes = attachments.reduce((total, item) => total + (item.base64 ? Buffer.from(item.base64, "base64").length : 0), 0);
   let downloads = 0, pending = decryptionMissing;
   const captured = new Set(attachments.map(item => item.locator));
-  for (const reference of observation.attachments) {
+  const streamed = async (info: MediaInfo): Promise<boolean> => {
+    if (!reader.preparedMedia || !receiver) return false;
+    const result = await reader.preparedMedia({ ...context, itemId: observationItemId(observation) }, info, receiver);
+    pending ||= result.pending; for (const gap of result.gaps) gaps.add(gap);
+    for (const part of result.parts) {
+      if (!known.has(part.locator)) {
+        observation.attachments.push({ locator: part.locator, custody: "reference", ...(part.derivation ? { derivation: part.derivation } : {}) }); known.add(part.locator);
+      }
+      if (part.derivation) gaps.delete("attachment_decryption_unavailable");
+      if (!captured.has(part.locator) && !published.has(digest(part.locator))) {
+        attachments.push({ locator: part.locator, sha256: part.original.sha256, original: part.original }); captured.add(part.locator);
+      }
+    }
+    return true;
+  };
+  for (const reference of [...observation.attachments]) {
     const info = inventory.find(item => item.locator === reference.locator);
     if (info?.encrypted) gaps.add("attachment_decryption_unavailable");
-    if (published.has(digest(reference.locator)) || captured.has(reference.locator)) continue;
+    if (reference.derivation?.kind === "matrix-media-decryption") continue;
+    const cipherSha = published.get(digest(reference.locator)) ?? info?.expectedDigest;
+    const decodedKnown = !!cipherSha && (published.has(digest(decryptedMediaLocator(reference.locator, cipherSha))) || captured.has(decryptedMediaLocator(reference.locator, cipherSha)));
+    if (decodedKnown) gaps.delete("attachment_decryption_unavailable");
+    if ((published.has(digest(reference.locator)) || captured.has(reference.locator)) && (!info?.encrypted || decodedKnown)) continue;
     gaps.add("attachment_bytes_unavailable");
     if (!reference.locator.startsWith("mxc://")) { gaps.add("attachment_locator_unsupported"); continue; }
+    if (info && (info.encrypted || info.expectedSize !== null && info.expectedSize > MEDIA_BYTES) && await streamed(info)) continue;
     if (info?.expectedSize !== null && info?.expectedSize !== undefined && info.expectedSize > MEDIA_BYTES) {
       gaps.add("attachment_size_limit"); continue;
     }
@@ -172,7 +241,9 @@ export async function preparePcpPublication(handoff: PcpSyncHandoff, id: string,
       attachments.push({ locator: reference.locator, base64: media.toString("base64"), sha256 });
       captured.add(reference.locator); bytes += media.length;
     } catch (error) {
-      if (error instanceof Error && /byte budget/.test(error.message)) gaps.add("attachment_size_limit");
+      if (error instanceof Error && /byte budget/.test(error.message)) {
+        if (!await streamed(info ?? { locator: reference.locator, encrypted: false, expectedDigest: null, expectedSize: null })) gaps.add("attachment_size_limit");
+      }
       else { gaps.add("attachment_download_unavailable"); pending = true; }
     }
   }
@@ -202,7 +273,7 @@ export async function runPcpAcquisitionTick({ client, handoff, receiver, reader,
     visited.add(item.id); handoff.markPublicationAttempt(item.id, now());
     if (item.state !== "ready") recovery++;
     try {
-      if (item.state !== "uncertain") await preparePcpPublication(handoff, item.id, client, reader, now());
+      if (item.state !== "uncertain") await preparePcpPublication(handoff, item.id, client, reader, now(), receiver);
       if (!stopped()) await publishPcpObservation(handoff, item.id, receiver);
     } catch { /* Independent durable obligation stays visible for recovery. */ }
   }
@@ -216,6 +287,12 @@ export async function runPcpAcquisitionTick({ client, handoff, receiver, reader,
   if (stopped() || handoff.hasLiveReady() || now() >= deadline) return;
   const coverage = handoff.coverage();
   if (coverage.pendingPublications >= 200) return;
+  if (handoff.accessibleInventoryDue(now())) {
+    handoff.markAccessibleInventory(now());
+    try { handoff.retainAccessibleInventory(await reader.accessibleInventory(), new Date(now()).toISOString()); }
+    catch { handoff.markAccessibleInventory(now(), "unavailable"); }
+    return;
+  }
   const work = handoff.historyWork(now());
   if (!work) return;
   handoff.markHistoryAttempt(work.id, now());
@@ -245,5 +322,5 @@ export function startPcpAcquisition(client: AcquisitionClient, handoff: PcpSyncH
   };
   const interval = setInterval(() => { void tick(); }, 30_000);
   void tick();
-  return () => { stopped = true; clearInterval(interval); };
+  return () => { stopped = true; clearInterval(interval); reader.stopMedia(); };
 }

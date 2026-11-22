@@ -3,15 +3,17 @@ import type fetch from "node-fetch";
 import { Response } from "node-fetch";
 import type { Readable } from "node:stream";
 import { MemoryStore } from "matrix-js-sdk";
+import { dirname, isAbsolute, join } from "node:path";
 import { exactPositiveReceipt, publicationQuery } from "./pcp-publication.js";
 import {
-  canonicalJson, digest, freezeSelection, selectSync, selectHistory, allJoinedSelection, nativeRoomId, publicationContext,
+  canonicalJson, digest, freezeSelection, selectSync, selectHistory, selectRoomState, allJoinedSelection, nativeRoomId, publicationContext, sourceObservationId,
   type PcpSyncSelection, type SelectedObservation, type AcquisitionMode,
 } from "./pcp-sync-observation.js";
 
 export const PCP_SELECTION_KEY = "pcp_matrix_selection";
 export const PCP_START_BOUNDARY_KEY = "pcp_matrix_start_boundary";
 export const MAX_SYNC_BYTES = 8 * 1024 * 1024;
+export const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
 export interface PcpLegacyStart {
   schema: "ea-matrix-pcp-start-v1";
   selection_sha256: string;
@@ -74,7 +76,7 @@ export interface PcpHistoryWork {
   room_id: string;
   next_token: string | null;
   stop_event_id: string | null;
-  kind: "full" | "gap";
+  kind: "full" | "gap" | "state";
 }
 
 export function assertNativeSelection(
@@ -173,7 +175,25 @@ export class PcpSyncHandoff {
             query_json TEXT NOT NULL, query_digest TEXT NOT NULL, receipt_json TEXT NOT NULL,
             PRIMARY KEY(id,generation)
           );
+          CREATE TABLE IF NOT EXISTS pcp_matrix_accessible_snapshots (
+            id TEXT PRIMARY KEY, sha256 TEXT NOT NULL, coverage_json TEXT NOT NULL,
+            observed_at TEXT NOT NULL, item_count INTEGER NOT NULL
+          );
         `);
+        // Existing room/job identities and their continuations stay intact.
+        // The new current-state obligation complements timeline history.
+        for (const room of db.prepare("SELECT room_id FROM pcp_matrix_rooms").all() as { room_id: string }[]) {
+          this.enqueueHistory(room.room_id, "state", null, null);
+        }
+        if (!db.prepare("SELECT 1 FROM sync_state WHERE key='pcp_matrix_media_transfer_v1'").get()) {
+          // A capture acknowledged before large-media/decryption support still
+          // owns its explicit missing media. Retry preparation without changing
+          // an attempted payload, receipt, native identity or capture state.
+          db.prepare(`UPDATE pcp_matrix_observations SET preparation_pending=1,preparation_retry_ms=0
+            WHERE state<>'held' AND (instr(gaps_json,'attachment_size_limit')>0 OR
+              instr(gaps_json,'attachment_decryption_unavailable')>0)`).run();
+          db.prepare("INSERT INTO sync_state(key,value) VALUES ('pcp_matrix_media_transfer_v1','enabled')").run();
+        }
       }
       db.prepare("INSERT OR IGNORE INTO sync_state(key,value) VALUES (?,?)")
         .run(PCP_SELECTION_KEY, canonicalJson(this.selection));
@@ -278,15 +298,16 @@ export class PcpSyncHandoff {
           .run(batchId, id, item.section, item.stream, item.ordinal);
       }
       if (allJoinedSelection(this.selection)) for (const coverage of selected.coverage) {
-        if (!coverage.roomId) continue;
+        if (!coverage.roomId || !["join", "leave"].includes(coverage.section)) continue;
         const previous = this.db.prepare("SELECT last_live_event FROM pcp_matrix_rooms WHERE room_id=?")
           .get(coverage.roomId) as { last_live_event: string | null } | undefined;
         this.db.prepare(`INSERT INTO pcp_matrix_rooms(room_id,joined,last_live_event) VALUES (?,?,?)
           ON CONFLICT(room_id) DO UPDATE SET joined=excluded.joined,
           last_live_event=COALESCE(excluded.last_live_event,pcp_matrix_rooms.last_live_event)`)
           .run(coverage.roomId, coverage.section === "join" ? 1 : 0, coverage.lastEventId);
-        if (coverage.section !== "join") continue;
+        if (!["join", "leave"].includes(coverage.section)) continue;
         this.enqueueHistory(coverage.roomId, "full", coverage.prevBatch, null);
+        this.enqueueHistory(coverage.roomId, "state", null, null);
         if (coverage.gaps.includes("timeline_limited") && coverage.prevBatch && previous?.last_live_event) {
           this.enqueueHistory(coverage.roomId, "gap", coverage.prevBatch, previous.last_live_event);
         }
@@ -297,7 +318,7 @@ export class PcpSyncHandoff {
     })();
   }
 
-  private enqueueHistory(roomId: string, kind: "full" | "gap", cursor: string | null, stop: string | null): void {
+  private enqueueHistory(roomId: string, kind: "full" | "gap" | "state", cursor: string | null, stop: string | null): void {
     const id = digest(canonicalJson(["ea-matrix-history-v1", this.selectionDigest, roomId, kind,
       ...(kind === "gap" ? [cursor, stop] : [])]));
     this.db.prepare(`INSERT OR IGNORE INTO pcp_matrix_history_jobs(id,room_id,kind,next_token,stop_event_id)
@@ -313,15 +334,28 @@ export class PcpSyncHandoff {
       ...(unsigned?.redacted_because !== undefined ? { redacted: true } : {}) }));
     const id = digest(canonicalJson([this.selectionDigest, item.roomId, item.eventId, item.wireSha256]));
     const prior = item.eventId ? this.db.prepare(`SELECT id,semantic_sha256 FROM pcp_matrix_observations
-      WHERE room_id=? AND event_id=? ORDER BY rowid LIMIT 1`).get(item.roomId, item.eventId) as
-      { id: string; semantic_sha256: string } | undefined : undefined;
+      WHERE room_id=? AND event_id=? ORDER BY CASE WHEN semantic_sha256=? THEN 0 ELSE 1 END,rowid LIMIT 1`).get(item.roomId, item.eventId, semantic) as
+      { id: string; semantic_sha256: string } | undefined : this.db.prepare(`SELECT id,semantic_sha256 FROM pcp_matrix_observations
+      WHERE room_id=? AND event_id IS NULL AND semantic_sha256=? ORDER BY rowid LIMIT 1`).get(item.roomId, semantic) as
+      { id: string; semantic_sha256: string } | undefined;
     const variant = prior && prior.semantic_sha256 !== semantic;
     const duplicate = prior && prior.id !== id && !variant;
-    const gaps = [...new Set([...item.gaps, ...(variant ? ["conflicting_native_observation"] : []),
+    const gaps = [...new Set([...item.gaps, ...(variant ? ["native_event_view"] : []),
       ...(duplicate ? ["duplicate_native_delivery"] : [])])];
     // Matrix edits and redactions have their own immutable event IDs. Retain
     // each event independently; its relation never replaces or holds a sibling.
-    const state: State = item.publication && !variant && !duplicate ? "ready" : "held";
+    if (variant && item.publication) {
+      const body = JSON.parse(item.publication), o = body.observation;
+      o.schema = "matrix-discord-observation/v2";
+      o.provenance = { kind: "native_event_view", endpoint: item.section === "history" ? "messages" : item.section === "state_snapshot" ? "state" : "sync",
+        section: item.section, stream: item.stream };
+      o.observation_id = sourceObservationId(item.roomId, o.provenance.kind, o.raw, item.section, item.stream);
+      o.gaps = gaps;
+      item.publication = JSON.stringify(body);
+      item.query = JSON.stringify(publicationQuery(item.publication, this.selection));
+      item.queryDigest = digest(canonicalJson(JSON.parse(item.query)));
+    }
+    const state: State = item.publication && !duplicate ? "ready" : "held";
     this.db.prepare(`INSERT OR IGNORE INTO pcp_matrix_observations
       (id,event_id,wire,wire_sha256,publication_json,query_json,query_digest,target_event_id,gaps_json,state,
       room_id,mode,semantic_sha256) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
@@ -338,20 +372,12 @@ export class PcpSyncHandoff {
           .run(JSON.stringify(body), original);
       }
     }
-    if (variant) {
-      const target = item.eventId;
-      const rows = this.db.prepare(`SELECT id,gaps_json FROM pcp_matrix_observations
-        WHERE room_id=? AND event_id=? AND state='ready'`).all(item.roomId, target) as { id: string; gaps_json: string }[];
-      for (const row of rows) this.db.prepare("UPDATE pcp_matrix_observations SET state='held',gaps_json=? WHERE id=?")
-        .run(JSON.stringify([...new Set([...JSON.parse(row.gaps_json),
-          "conflicting_native_observation"])]), row.id);
-    }
     this.db.prepare(`INSERT INTO pcp_matrix_batch_items(batch_id,observation_id,section,stream,ordinal)
       VALUES (?,?,?,?,?)`).run(batchId, id, item.section + ":" + item.roomId, item.stream, item.ordinal);
   }
 
-  /** Inventory changes only acquisition membership; retained items and cursors
-   * survive departures. Rejoining resumes the prior room history job. */
+  /** Retained items and independent history cursors survive departures.
+   * Readable historical rooms continue without a new membership action. */
   recordJoinedRooms(rooms: string[]): void {
     if (!allJoinedSelection(this.selection) || !Array.isArray(rooms) || rooms.some(room => !nativeRoomId(room)) ||
         new Set(rooms).size !== rooms.length) throw new Error("Invalid complete Matrix room inventory");
@@ -362,7 +388,47 @@ export class PcpSyncHandoff {
         this.db.prepare(`INSERT INTO pcp_matrix_rooms(room_id,joined) VALUES (?,1)
           ON CONFLICT(room_id) DO UPDATE SET joined=1`).run(room);
         this.enqueueHistory(room, "full", null, null);
+        this.enqueueHistory(room, "state", null, null);
       }
+    }).immediate();
+  }
+
+  accessibleInventoryDue(now = Date.now()): boolean {
+    const row = this.db.prepare("SELECT value FROM sync_state WHERE key='pcp_matrix_accessible_inventory'").get() as { value: string } | undefined;
+    return !row || JSON.parse(row.value).retry_after_ms <= now;
+  }
+
+  markAccessibleInventory(now = Date.now(), status: "reading" | "unavailable" = "reading"): void {
+    this.db.prepare("INSERT OR REPLACE INTO sync_state(key,value) VALUES ('pcp_matrix_accessible_inventory',?)")
+      .run(JSON.stringify({ last_attempt_ms: now, retry_after_ms: now + 300_000, status }));
+  }
+
+  /** A read-only initial snapshot discovers left/invited/knocked rooms and
+   * retains accessible state. Its next_batch is never adopted as the live
+   * checkpoint and its to-device/security-control fields are never selected. */
+  retainAccessibleInventory(bytes: Buffer, observedAt = new Date().toISOString()): void {
+    if (!allJoinedSelection(this.selection) || bytes.length > MAX_SNAPSHOT_BYTES) throw new Error("Matrix inventory exceeds retention bound");
+    const snapshot = selectSync(bytes, this.selection, observedAt, new Set(), true);
+    const hash = digest(bytes), id = digest(canonicalJson(["ea-matrix-accessible-snapshot-v1", this.selectionDigest, hash]));
+    this.db.transaction(() => {
+      this.assertBinding();
+      if (!this.db.prepare("SELECT 1 FROM pcp_matrix_accessible_snapshots WHERE id=?").get(id)) {
+        this.db.prepare("INSERT INTO pcp_matrix_accessible_snapshots(id,sha256,coverage_json,observed_at,item_count) VALUES (?,?,?,?,?)")
+          .run(id, hash, JSON.stringify(snapshot.coverage), observedAt, snapshot.items.length);
+        for (const item of snapshot.items) this.retainItem(item, id);
+        for (const coverage of snapshot.coverage) {
+          if (!coverage.roomId || !["join", "leave"].includes(coverage.section)) continue;
+          // The concurrent live /sync owns membership freshness. Discovery may
+          // add an unknown room, but may not overwrite a newer live departure.
+          this.db.prepare("INSERT OR IGNORE INTO pcp_matrix_rooms(room_id,joined) VALUES (?,?)")
+            .run(coverage.roomId, coverage.section === "join" ? 1 : 0);
+          this.enqueueHistory(coverage.roomId, "full", coverage.prevBatch, null);
+          this.enqueueHistory(coverage.roomId, "state", null, null);
+        }
+      }
+      this.db.prepare("INSERT OR REPLACE INTO sync_state(key,value) VALUES ('pcp_matrix_accessible_inventory',?)")
+        .run(JSON.stringify({ last_attempt_ms: Date.parse(observedAt), retry_after_ms: Date.parse(observedAt) + 86_400_000,
+          status: "retained", snapshot_id: id }));
     }).immediate();
   }
 
@@ -370,7 +436,7 @@ export class PcpSyncHandoff {
     this.assertBinding();
     return this.db.prepare(`SELECT j.id,j.room_id,j.next_token,j.stop_event_id,j.kind
       FROM pcp_matrix_history_jobs j JOIN pcp_matrix_rooms r ON r.room_id=j.room_id
-      WHERE r.joined=1 AND j.complete=0 AND j.retry_after_ms<=?
+      WHERE j.complete=0 AND j.retry_after_ms<=?
       ORDER BY CASE j.kind WHEN 'gap' THEN 0 ELSE 1 END,j.last_attempt_ms,j.rowid LIMIT 1`)
       .get(now) as PcpHistoryWork | undefined ?? null;
   }
@@ -382,8 +448,9 @@ export class PcpSyncHandoff {
   }
 
   retainHistory(work: PcpHistoryWork, bytes: Buffer, observedAt = new Date().toISOString()): void {
-    if (bytes.length > MAX_SYNC_BYTES) throw new Error("Matrix history page exceeds retention bound");
-    const page = selectHistory(bytes, this.selection, work.room_id, observedAt);
+    if (bytes.length > (work.kind === "state" ? MAX_SNAPSHOT_BYTES : MAX_SYNC_BYTES)) throw new Error("Matrix history page exceeds retention bound");
+    const page = work.kind === "state" ? selectRoomState(bytes, this.selection, work.room_id, observedAt)
+      : selectHistory(bytes, this.selection, work.room_id, observedAt);
     const hash = digest(bytes), id = digest(canonicalJson(["ea-matrix-history-page-v1", work.id, work.next_token, hash]));
     this.db.transaction(() => {
       this.assertBinding();
@@ -423,6 +490,10 @@ export class PcpSyncHandoff {
 
   markPublicationAttempt(id: string, now = Date.now()): void {
     this.db.prepare("UPDATE pcp_matrix_observations SET last_attempt_ms=? WHERE id=?").run(now, id);
+  }
+
+  mediaSpoolDirectory(): string | null {
+    return isAbsolute(this.db.name) ? join(dirname(this.db.name), "pcp-media") : null;
   }
 
   publishedAttachments(id: string): Map<string, string> {
@@ -480,11 +551,14 @@ export class PcpSyncHandoff {
       .run(room, target);
   }
 
-  coverage(): { rooms: number; unfinishedHistory: number; pendingPublications: number; heldObservations: number } {
+  coverage(): { rooms: number; historicalRooms: number; unfinishedHistory: number; unfinishedState: number; accessibleSnapshots: number; pendingPublications: number; heldObservations: number } {
     const count = (query: string) => (this.db.prepare(query).get() as { n: number }).n;
     return {
       rooms: count("SELECT count(*) n FROM pcp_matrix_rooms WHERE joined=1"),
-      unfinishedHistory: count("SELECT count(*) n FROM pcp_matrix_history_jobs j JOIN pcp_matrix_rooms r ON r.room_id=j.room_id WHERE r.joined=1 AND j.complete=0"),
+      historicalRooms: count("SELECT count(*) n FROM pcp_matrix_rooms WHERE joined=0"),
+      unfinishedHistory: count("SELECT count(*) n FROM pcp_matrix_history_jobs WHERE kind<>'state' AND complete=0"),
+      unfinishedState: count("SELECT count(*) n FROM pcp_matrix_history_jobs WHERE kind='state' AND complete=0"),
+      accessibleSnapshots: count("SELECT count(*) n FROM pcp_matrix_accessible_snapshots"),
       pendingPublications: count("SELECT count(*) n FROM pcp_matrix_observations WHERE state IN ('ready','uncertain') OR preparation_pending=1 AND state='acknowledged'"),
       heldObservations: count("SELECT count(*) n FROM pcp_matrix_observations WHERE state='held'"),
     };

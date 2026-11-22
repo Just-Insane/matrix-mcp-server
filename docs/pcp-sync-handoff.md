@@ -17,8 +17,9 @@ The optional MatrixClientConfig.pcpSync value binds one exact homeserver, user,
 device and fixed PCP receiver URL. The existing ea-chat-source-v1 policy binds
 one room and one mode. The ea-chat-source-v2 policy retains source, account,
 profile, principal, policy_version and basis, with room_scope: all_joined and
-mode: live_and_historical. It enumerates only the retained account's joined rooms;
-it does not join a room or acquire a new provider grant.
+mode: live_and_historical. The retained v2 policy identity stays unchanged while
+acquisition enumerates current and previously joined rooms plus accessible
+stripped invitation/knock state. It does not join a room or acquire a new grant.
 The authenticated client identity is checked before its first sync.
 
 The existing client remains the only sync client, and message-queue.db remains
@@ -189,9 +190,10 @@ The legacy v1 handoff holds edits, redactions and conflicting observations.
 The v2 all-joined handoff publishes each native edit or redaction under its own
 immutable event ID, including its source-provided target relation. It does not
 replace or hold the target event. A redacted native view retains the bytes still
-available with an explicit native_content_redacted gap. Genuinely conflicting
-observations of the same event remain held. Arrival order, timestamps and receipt
-clocks never establish authority to replace another event.
+available with an explicit native_content_redacted gap. A different native view
+of the same event is a separate chat-source-observation, linked to the real
+native event ID. It cannot replace that event or clear an uncertain publication.
+Arrival order, timestamps and receipt clocks never replace another event.
 [PCP286](https://github.com/Just-Insane/personal-context-platform/issues/286)'s
 authenticated native cause/currentness binding remains an unresolved interface.
 
@@ -228,9 +230,9 @@ remain their own existing interfaces.
 
 `pcp-acquisition.ts` extends the existing collector; it creates no second Matrix
 client or sync consumer. Live `/sync` retains every joined room's native timeline
-and state event before advancing the existing checkpoint. Invitations and
-unjoined room contents are excluded. A departure preserves prior custody and
-continuations; rejoining resumes them. Native room/event identities remain
+and state event before advancing the existing checkpoint. Accessible leave,
+invitation and knock observations are also retained. A departure preserves prior
+custody and continues readable history without rejoining. Native identities remain
 separate from any claimed Discord bridge mapping.
 
 The collector enumerates the complete native joined-room list, including quiet
@@ -242,6 +244,29 @@ next room continuation in one SQLite transaction. History never writes
 missing `end`, or the exact known event bounding a gap job, closes that job.
 Repeated cursors remain stalled, and failures retain the previous continuation.
 The page limit is resumable and has no total-history cutoff.
+
+Once daily, when live work and the publication backlog permit, the same native
+reader obtains an inline-filter initial `/sync` snapshot with `include_leave`.
+There is no `since` token, filter creation, second SDK client or injection into
+SDK room state. The snapshot's returned token is never adopted as the saved
+live cursor. Exact room-event spans and snapshot provenance commit separately
+before discovered history jobs are enrolled. Security-control/to-device,
+account-data, presence and ephemeral content are not knowledge observations.
+Forgotten rooms or content withheld by the homeserver cannot be discovered by
+this API; missing sections never prove deletion or complete historical coverage.
+
+The discovery snapshot uses lazy members to keep inventory bounded. Every
+current or previously joined room also has an independent full `/state` job,
+including member events omitted from lazy inventory. State and inventory reads
+have a 64 MiB response bound and explicit unfinished responsibility on failure;
+timeline pages retain their 8 MiB bound. Existing history cursors and job IDs are
+never reset by discovery, state capture, departures or restarts.
+
+Stripped invite/knock state has no native event ID. Its v2 source-observation
+envelope keeps `event_id: null`, the exact original bytes and actual section,
+stream and endpoint provenance. A separate digest-bound `observation_id` is an
+acquisition identity, never a fabricated Matrix event. Different native views
+also use that source-observation identity while preserving their real event ID.
 
 The single-flight collector turn runs every 30 seconds. It offers at most ten
 publications, selecting fresh live records between remote calls. At most two
@@ -260,21 +285,37 @@ replaces a device or exports keys. Original ciphertext remains unchanged. Missin
 keys remain explicit and are retried by the same collector after five minutes.
 
 Available native MXC attachments are read through the authenticated homeserver,
-with redirects prohibited. A publication carries up to 16 MiB of media in a
-24 MiB JSON envelope; up to four native downloads are attempted per preparation.
-After an exact positive receipt, a later media batch or newly available plaintext
-uses the same native record and a monotonic rendition. The previous publication
-and receipt are archived before a different attempt is allowed. An uncertain
-publication is immutable and can only be reconciled, never blindly replayed.
-Existing acknowledged media is not downloaded or resent during later batches.
+with redirects prohibited. Small plaintext media can use the existing 16 MiB
+inline batch. Larger media and encrypted files use the common immutable-original
+upload protocol with 8 MiB chunks and a 5 GiB per-object platform limit. A private
+spool belongs to this same native collector and retains full-file/chunk digests.
+Exact remote status reconciles lost chunk/finalization responses before any
+further transfer. The receiver derives the R2 scope from the fixed source,
+account, native item identity and locator digest; an arbitrary stored descriptor
+cannot be attached to another record.
 
-Encrypted media is retained as exact ciphertext with a separate decryption gap;
-it is not relabelled as a decoded file. Unsupported external locators, files over
-16 MiB, missing keys, media failures, oversized native responses and conflicting
-observations remain explicit gaps. Native edit/redaction events and their target
-relations are published independently, including edits discovered through later
-decryption of already captured ciphertext. They never rewrite their target.
-Healthy siblings continue. Page traversal completion is not publication,
+One background media transfer runs inside the existing collector. It starts and
+advances remote chunks only when live publication permits; live sync and message
+publication do not wait for a whole large download. No new service, timer, SDK
+client, credential or grant is added. The same durable observation remains
+pending until its original descriptor is published. After checksum-confirmed R2
+retention, only temporary local transfer copies are removed.
+
+Encrypted attachment v2 files are first retained as exact ciphertext and checked
+against the source SHA-256. The standard AES-256-CTR key and IV already present in
+the accessible event can then produce a separate decoded rendition. Its distinct
+locator, digest and derivation name the original ciphertext; it never substitutes
+for or relabels the encrypted original. The private transfer journal contains no
+file key. Nested edit content and thumbnails are enumerated as well. Unsupported
+key formats, missing keys, native download failures and platform-size limits
+remain explicit gaps. The previous capture/receipt is archived before a later
+monotonic rendition; uncertain publications stay immutable and are reconciled.
+Acknowledged pre-upgrade size/decryption gaps are re-enrolled for preparation
+without changing their payload or capture state.
+
+Native edit/redaction events and their target relations are published
+independently, including edits discovered through later decryption. They never
+rewrite their target. Healthy siblings continue. Page traversal completion is not publication,
 media, key or lifecycle completion; `coverage()` reports these outstanding work
 counts separately.
 

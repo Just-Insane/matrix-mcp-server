@@ -45,6 +45,13 @@ export interface PcpSyncSelection {
 export const allJoinedSelection = (selection: PcpSyncSelection): boolean =>
   selection.policy.schema === "ea-chat-source-v2";
 export const nativeRoomId = (room: unknown): room is string => text(room) && room.startsWith("!");
+/** An observation key is deliberately separate from a provider event ID.
+ * Stripped invitation state has no event ID; a redacted/native view may share
+ * one with an earlier immutable payload. Neither invents a Matrix event. */
+export const observationItemId = (value: any): string => value.observation_id ?? value.event_id;
+export function sourceObservationId(room: string, kind: string, raw: unknown, section: string, stream: string): string {
+  return "matrix-observation:sha256:" + digest(canonicalJson(["matrix-source-observation-v1", room, kind, section, stream, raw]));
+}
 export function publicationContext(value: unknown, selection: PcpSyncSelection): { room: string; mode: AcquisitionMode } {
   if (!object(value) || !object(value.observation) || !nativeRoomId(value.observation.room_id)) {
     throw new Error("Invalid frozen Matrix publication context");
@@ -184,6 +191,27 @@ function prepareObservation(
     wire, wireSha256: digest(wire), section, stream, ordinal,
     publication: null, query: null, queryDigest: null, targetEventId: null, gaps,
   };
+  if (allJoinedSelection(selection) && object(raw) && raw.event_id === undefined &&
+      ((section === "invite" && stream === "invite_state") || (section === "knock" && stream === "knock_state")) &&
+      text(raw.type) && typeof raw.state_key === "string" && object(raw.content)) {
+    const provenance = { kind: "stripped_state", endpoint: "sync", section, stream };
+    const observation = {
+      schema: "matrix-discord-observation/v2", source: "matrix", account: selection.policy.account,
+      room_id: roomId, event_id: null,
+      observation_id: sourceObservationId(roomId, provenance.kind, raw, section, stream), provenance,
+      thread_id: null, observed_at: observedAt, event_time: null, raw,
+      decryption: "available", coverage: "partial", bridge: { status: "none", native_id: null, bridged_id: null },
+      gaps: [...gaps, "stripped_state_only", "native_event_identity_unavailable", "native_event_time_unavailable"],
+      relation: { kind: "original", target_event_id: null }, attachments: [],
+    };
+    const { observed_at: _clock, ...meaning } = observation;
+    const query = { schema: "ea-chat-receipt-query-v2", event_id: null, observation_id: observation.observation_id,
+      native_sha256: digest(wire), observation_digest: digest(canonicalJson(meaning)), fidelity: "original", attachments: [] };
+    result.gaps = observation.gaps;
+    result.publication = JSON.stringify({ observation, provider_bytes: wire.toString("base64"), acquisition: { mode } });
+    result.query = JSON.stringify(query); result.queryDigest = digest(canonicalJson(query));
+    return result;
+  }
   if (!object(raw) || !result.eventId || !result.eventId.startsWith("$")) {
     gaps.push("native_event_identity_unavailable"); return result;
   }
@@ -261,7 +289,7 @@ function prepareObservation(
 }
 
 export function selectSync(bytes: Buffer, selection: PcpSyncSelection, observedAt: string,
-  previouslyJoined: ReadonlySet<string> = new Set()): SelectedSync {
+  previouslyJoined: ReadonlySet<string> = new Set(), snapshot = false): SelectedSync {
   if (!/^\d{4}-\d{2}-\d{2}T.+(?:Z|[+-]\d{2}:\d{2})$/.test(observedAt) ||
       !Number.isFinite(Date.parse(observedAt))) throw new Error("Invalid Matrix observation clock");
   const { value, elements, source } = parseSpans(bytes);
@@ -280,9 +308,7 @@ export function selectSync(bytes: Buffer, selection: PcpSyncSelection, observedA
     const group = rooms[section];
     if (group === undefined) continue;
     if (!object(group)) throw new Error("Invalid Matrix room group");
-    const selectedRooms = selection.policy.schema === "ea-chat-source-v1" ? [selection.policy.room]
-      : section === "join" ? Object.keys(group) : section === "leave"
-        ? Object.keys(group).filter(room => previouslyJoined.has(room)) : [];
+    const selectedRooms = selection.policy.schema === "ea-chat-source-v1" ? [selection.policy.room] : Object.keys(group);
     for (const roomId of selectedRooms) {
       const room = group[roomId];
       if (room === undefined) continue;
@@ -306,7 +332,7 @@ export function selectSync(bytes: Buffer, selection: PcpSyncSelection, observedA
           if (!span) throw new Error("Selected Matrix event span unavailable");
           const wire = Buffer.from(source.slice(...span), "utf8");
           result.items.push(prepareObservation(selection, raw, wire, section, stream, ordinal, observedAt, gaps,
-            roomId, selection.policy.schema === "ea-chat-source-v1" ? selection.policy.mode : "live"));
+            roomId, selection.policy.schema === "ea-chat-source-v1" ? selection.policy.mode : snapshot ? "historical" : "live"));
         });
       }
     }
@@ -315,6 +341,23 @@ export function selectSync(bytes: Buffer, selection: PcpSyncSelection, observedA
     roomId: null, section: "unobserved", gaps: ["selected_room_not_observed", "upstream_history_unverified"], prevBatch: null, lastEventId: null,
   });
   return result;
+}
+
+/** Current native state is independently readable even when old timeline
+ * retention is limited. Its exact event spans are retained as historical
+ * acquisition; the /state response has no live-sync cursor. */
+export function selectRoomState(bytes: Buffer, selection: PcpSyncSelection, roomId: string,
+  observedAt: string): { items: SelectedObservation[]; next: null } {
+  if (!nativeRoomId(roomId) || !allJoinedSelection(selection)) throw new Error("Invalid Matrix state scope");
+  if (!Number.isFinite(Date.parse(observedAt))) throw new Error("Invalid Matrix observation clock");
+  const { value, elements, source } = parseSpans(bytes);
+  if (!Array.isArray(value)) throw new Error("Invalid Matrix state snapshot");
+  return { next: null, items: value.map((raw, ordinal) => {
+    const span = elements.get(value)?.[ordinal];
+    if (!span) throw new Error("Matrix state event span unavailable");
+    return prepareObservation(selection, raw, Buffer.from(source.slice(...span), "utf8"), "state_snapshot", "state",
+      ordinal, observedAt, [], roomId, "historical");
+  }) };
 }
 
 /** Native /messages pages have an independent per-room continuation. Exact

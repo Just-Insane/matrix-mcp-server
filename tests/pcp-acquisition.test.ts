@@ -37,7 +37,7 @@ function fixture(t: TestContext) {
 function positive(handoff: PcpSyncHandoff, id: string) {
   const frozen = handoff.publication(id)!, query = JSON.parse(frozen.query);
   const { room } = publicationContext(JSON.parse(frozen.body), selection);
-  const item = canonicalJson([selection.policy.profile, room, query.event_id]);
+  const item = canonicalJson([selection.policy.profile, room, query.observation_id ?? query.event_id]);
   const record = "ea-record:source-v2:" + digest(JSON.stringify(["matrix", selection.policy.account, item]));
   const revision = "source:" + digest(JSON.stringify(["matrix", selection.policy.account, item, "sha256:" + query.native_sha256]));
   return { status: "captured", read_only: true, replay_authorized: false, query_digest: frozen.queryDigest,
@@ -68,19 +68,19 @@ test("all-joined selection is explicit and cannot become a provider/account/room
   }
 });
 
-test("same sync atomically retains own messages, native state and every joined room without collecting invitations", t => {
+test("same sync atomically retains own messages, native state and every joined room and accessible invitation observations", t => {
   const { handoff, db } = fixture(t);
   const wire = JSON.parse(sync("s1", { [ROOM]: [event("$own"), event("$reaction", {}, { type: "m.reaction" })],
     [OTHER]: [event("$other")] }).toString());
   wire.rooms.invite = { "!unjoined:example.com": { invite_state: { events: [event("$not-joined")] } } };
   handoff.retain(Buffer.from(JSON.stringify(wire)), null);
-  assert.deepEqual(handoff.obligations().map(item => item.event_id), ["$own", "$reaction", "$other"]);
+  assert.deepEqual(handoff.obligations().map(item => item.event_id), ["$own", "$reaction", "$other", "$not-joined"]);
   assert.ok(handoff.obligations().every(item => item.state === "ready"));
   assert.equal(handoff.checkpoint(), "s1");
-  assert.equal((db.prepare("SELECT count(*) n FROM pcp_matrix_history_jobs").get() as any).n, 2);
+  assert.equal((db.prepare("SELECT count(*) n FROM pcp_matrix_history_jobs").get() as any).n, 4);
   db.exec("CREATE TRIGGER fail_room BEFORE INSERT ON pcp_matrix_rooms BEGIN SELECT RAISE(ABORT,'fixture retention failure'); END");
   assert.throws(() => handoff.retain(sync("s2", { "!new:example.com": [event("$rollback")] }), "s1"));
-  assert.equal(handoff.checkpoint(), "s1"); assert.equal(handoff.obligations().length, 3);
+  assert.equal(handoff.checkpoint(), "s1"); assert.equal(handoff.obligations().length, 4);
 });
 
 test("quiet-room inventory and empty continuation pages resume durably without changing the live cursor", t => {
@@ -93,10 +93,16 @@ test("quiet-room inventory and empty continuation pages resume durably without c
   assert.equal((db.prepare("SELECT complete FROM pcp_matrix_history_jobs WHERE id=?").get(first.id) as any).complete, 0);
   assert.equal(handoff.checkpoint(), "live-token");
   const resumed = new PcpSyncHandoff(db, selection);
+  const state = resumed.historyWork(NOW)!;
+  assert.equal(state.kind, "state"); resumed.markHistoryAttempt(state.id, NOW);
+  resumed.retainHistory(state, Buffer.from("[]"));
   const other = resumed.historyWork(NOW)!;
   assert.notEqual(other.room_id, first.room_id);
   resumed.markHistoryAttempt(other.id, NOW + 1); resumed.retainHistory(other, history([]));
-  const continuation = resumed.historyWork(NOW + 2)!;
+  const otherState = resumed.historyWork(NOW + 2)!;
+  assert.equal(otherState.kind, "state"); resumed.markHistoryAttempt(otherState.id, NOW + 2);
+  resumed.retainHistory(otherState, Buffer.from("[]"));
+  const continuation = resumed.historyWork(NOW + 3)!;
   assert.equal(continuation.next_token, "next-page");
   resumed.retainHistory(continuation, history([event("$old", undefined, { room_id: first.room_id })]));
   assert.equal(resumed.coverage().unfinishedHistory, 0);
@@ -206,7 +212,7 @@ test("live work is chosen before historical capture and an unresolved live recei
       const item = handoff.obligations().find(item => item.event_id === eventId)!;
       return eventId === "$live" ? { status: "absent" } : positive(handoff, item.id);
     } };
-  const reader: any = { media: async () => { throw new Error("No media"); }, history: async () => history([]) };
+  const reader: any = { accessibleInventory: async () => sync("snapshot-only", {}), media: async () => { throw new Error("No media"); }, history: async () => history([]) };
   await runPcpAcquisitionTick({ handoff, client: client(), receiver, reader, now: () => NOW });
   assert.deepEqual(sent, ["$live", "$history"]);
   await runPcpAcquisitionTick({ handoff, client: client(), receiver, reader, now: () => NOW + 60_001 });
@@ -318,4 +324,113 @@ test("pinned v2 startup enables publisher only with the matching existing privat
   assert.throws(() => loadPcpStartup(env), error => !String(error).includes("fabricated-never-log"));
   env.MATRIX_PCP_STARTUP_SHA256 = set(value); chmodSync(file, 0o644);
   assert.throws(() => loadPcpStartup(env), /unsafe/);
+});
+
+
+test("accessible inventory retains left rooms and stripped state without adopting its live cursor", t => {
+  const { handoff, db } = fixture(t);
+  handoff.retain(sync("live-cursor", { [ROOM]: [event("$live")] }), null);
+  const stripped = { type: "m.room.name", state_key: "", sender: selection.userId, content: { name: "Observed invitation" } };
+  const snapshot = Buffer.from(JSON.stringify({ next_batch: "must-not-be-adopted", rooms: {
+    join: { [ROOM]: { timeline: { events: [event("$live")], prev_batch: "initial-before" } } },
+    leave: { [OTHER]: { timeline: { events: [event("$left")], prev_batch: "left-before" } } },
+    invite: { "!invited:example.com": { invite_state: { events: [stripped] } } },
+    knock: { "!knocked:example.com": { knock_state: { events: [stripped] } } },
+  }, to_device: { events: [{ type: "m.room_key", content: { session_key: "fixture-must-not-enter-custody" } }] } }));
+  const before = handoff.selectionDigest;
+  handoff.retainAccessibleInventory(snapshot, new Date(NOW).toISOString());
+  assert.equal(handoff.checkpoint(), "live-cursor"); assert.equal(handoff.selectionDigest, before);
+  assert.equal(handoff.coverage().historicalRooms, 1); assert.equal(handoff.coverage().accessibleSnapshots, 1);
+  assert.equal(handoff.accessibleInventoryDue(NOW + 1), false);
+  const values = handoff.obligations().filter(x => x.state === "ready").map(x => ({ row: x, body: JSON.parse(handoff.publication(x.id)!.body) }));
+  for (const { row, body } of values.filter(x => x.row.event_id === null)) {
+    assert.equal(body.observation.event_id, null); assert.equal(body.observation.raw.event_id, undefined);
+    assert.equal(body.observation.schema, "matrix-discord-observation/v2");
+    assert.match(body.observation.observation_id, /^matrix-observation:sha256:/);
+    assert.deepEqual(Buffer.from(body.provider_bytes, "base64"), handoff.original(row.id));
+    assert.equal(body.acquisition.mode, "historical"); acknowledge(handoff, row.id);
+  }
+  assert.equal(values.filter(x => x.row.event_id === null).length, 2);
+  assert.ok(!JSON.stringify(db.prepare("SELECT publication_json FROM pcp_matrix_observations").all()).includes("fixture-must-not-enter-custody"));
+  handoff.recordJoinedRooms([]);
+  const leftJob = db.prepare("SELECT id,next_token FROM pcp_matrix_history_jobs WHERE room_id=? AND kind='full'").get(OTHER) as any;
+  assert.equal(leftJob.next_token, "left-before");
+  assert.ok(handoff.historyWork(NOW)); assert.equal(handoff.coverage().unfinishedHistory, 2);
+  const count = handoff.obligations().length;
+  handoff.retainAccessibleInventory(snapshot, new Date(NOW + 1).toISOString());
+  assert.equal(handoff.obligations().length, count);
+});
+
+test("full state retains members omitted by lazy inventory and native views never replace prior captures", t => {
+  const { handoff, db } = fixture(t);
+  handoff.retain(sync("s1", { [ROOM]: [event("$same", { body: "original available text" })] }), null);
+  const first = handoff.obligations()[0]; acknowledge(handoff, first.id);
+  const stateWork = db.prepare("SELECT id,room_id,next_token,stop_event_id,kind FROM pcp_matrix_history_jobs WHERE kind='state'").get() as any;
+  const member = event("$member", { membership: "join", displayname: "Member" }, { type: "m.room.member", state_key: "@member:example.com" });
+  handoff.retainHistory(stateWork, Buffer.from(JSON.stringify([member])));
+  handoff.retain(sync("s2", { [ROOM]: [event("$same", {}, { unsigned: { redacted_because: { event_id: "$redactor" } } })] }), "s1");
+  assert.equal(handoff.state(first.id), "acknowledged");
+  const changed = handoff.obligations().find(x => x.event_id === "$same" && x.id !== first.id)!;
+  assert.equal(changed.state, "ready");
+  const body = JSON.parse(handoff.publication(changed.id)!.body);
+  assert.equal(body.observation.event_id, "$same"); assert.equal(body.observation.raw.event_id, "$same");
+  assert.equal(body.observation.provenance.kind, "native_event_view");
+  assert.notEqual(body.observation.observation_id, "$same"); acknowledge(handoff, changed.id);
+  assert.equal(handoff.coverage().unfinishedState, 0);
+  assert.equal(handoff.checkpoint(), "s2");
+});
+
+test("inventory reads use an inline include_leave snapshot with no saved cursor or filter creation", async t => {
+  const { handoff } = fixture(t); handoff.retain(sync("saved-live-cursor", {}), null);
+  const calls: URL[] = [];
+  const reader = new PcpNativeReader(client(), handoff, (async (input, init) => {
+    const url = new URL(String(input)); calls.push(url); assert.equal(init!.method, "GET");
+    return new Response(sync("different-snapshot-cursor", {}));
+  }) as typeof fetch);
+  handoff.retainAccessibleInventory(await reader.accessibleInventory(), new Date(NOW).toISOString());
+  assert.equal(calls.length, 1); assert.equal(calls[0].searchParams.has("since"), false);
+  assert.equal(JSON.parse(calls[0].searchParams.get("filter")!).room.include_leave, true);
+  assert.equal(handoff.checkpoint(), "saved-live-cursor");
+});
+
+test("nested edited media can publish streamed ciphertext and a separately identified decoded rendition", async t => {
+ const { handoff } = fixture(t), locator = "mxc://example.com/edited-file", cipherSha = "c".repeat(64), clearSha = "d".repeat(64);
+ const file = { url: locator, v: "v2", key: { kty: "oct", alg: "A256CTR", k: "fixture" }, iv: "fixture", hashes: { sha256: Buffer.from(cipherSha, "hex").toString("base64") } };
+ handoff.retain(sync("s1", { [ROOM]: [event("$large-edit", { body: "* edited file", "m.relates_to": { rel_type: "m.replace", event_id: "$earlier" },
+  "m.new_content": { body: "file", msgtype: "m.file", file, info: { size: 20 * 1024 * 1024 } } })] }), null);
+ const id = handoff.obligations()[0].id, decoded = "matrix-decrypted:sha256:" + digest(canonicalJson([locator, cipherSha]));
+ const descriptor = (location: string, sha256: string) => {
+  const item = canonicalJson([selection.policy.profile, ROOM, "$large-edit"]);
+  const scope = digest(canonicalJson(["ea-original-upload-v1", ["matrix", selection.policy.account, item, digest(location)]]));
+  return { object_ref: "r2://ea-raw/sources/common/streamed-originals/v1/" + scope + "/" + sha256, sha256, byte_size: 20 * 1024 * 1024,
+   media_type: "application/octet-stream", source_locator: location };
+ };
+ const receiver = new PcpReceiver(selection, { clientId: "fixture-client", clientSecret: "fabricated" });
+ const reader = { media: async () => { throw new Error("Large media must not use the inline path"); }, preparedMedia: async (_context: any, info: any) => {
+  assert.equal(info.locator, locator); assert.equal(info.encrypted, true);
+  return { pending: false, gaps: [], parts: [{ locator, original: descriptor(locator, cipherSha) }, { locator: decoded, original: descriptor(decoded, clearSha),
+   derivation: { kind: "matrix-media-decryption" as const, source_locator: locator, source_sha256: cipherSha } }] };
+ } };
+ await preparePcpPublication(handoff, id, client(), reader, NOW, receiver);
+ const frozen = handoff.publication(id)!, body = JSON.parse(frozen.body);
+ assert.equal(body.attachments.length, 2); assert.equal(body.observation.attachments.length, 2);
+ assert.equal(body.attachments.some((x: any) => x.base64 !== undefined), false);
+ assert.equal(body.observation.gaps.includes("attachment_bytes_unavailable"), false);
+ assert.equal(body.observation.gaps.includes("attachment_decryption_unavailable"), false);
+ assert.equal(JSON.parse(frozen.query).attachments.length, 2); acknowledge(handoff, id);
+ const wrong = JSON.parse(frozen.body); wrong.attachments[0].original.object_ref = "r2://ea-raw/unrelated";
+ assert.throws(() => publicationQuery(JSON.stringify(wrong), selection), /bound/);
+});
+
+test("media capability upgrade retries old gaps without rewriting acknowledged or uncertain payloads", async t => {
+ const { handoff, db } = fixture(t);
+ handoff.retain(sync("s1", { [ROOM]: [event("$old-large", { body: "file", url: "mxc://example.com/old-large", info: { size: 20 * 1024 * 1024 } })] }), null);
+ const id = handoff.obligations()[0].id;
+ await preparePcpPublication(handoff, id, client(), { media: async () => { throw new Error("Old bound"); } }, NOW);
+ acknowledge(handoff, id); const before = handoff.publication(id);
+ db.prepare("UPDATE pcp_matrix_observations SET preparation_pending=0 WHERE id=?").run(id);
+ db.prepare("DELETE FROM sync_state WHERE key='pcp_matrix_media_transfer_v1'").run();
+ const resumed = new PcpSyncHandoff(db, selection);
+ assert.equal(resumed.state(id), "acknowledged"); assert.deepEqual(resumed.publication(id), before);
+ assert.equal((db.prepare("SELECT preparation_pending FROM pcp_matrix_observations WHERE id=?").get(id) as any).preparation_pending, 1);
 });
