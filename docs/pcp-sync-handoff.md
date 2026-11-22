@@ -185,10 +185,13 @@ Invalid individual events retain blocked responsibility and exact bytes.
 Ambiguous duplicate keys, invalid UTF-8, malformed selected containers,
 excessive nesting and sync responses above 8 MiB fail before cursor advancement.
 
-Edits, redactions, redacted payloads and conflicting observations remain held.
-Native targets are retained, and unresolved mutations conservatively hold unsent
-target publications. This does not select a current revision. Arrival order,
-timestamps and receipt clocks never establish lifecycle authority.
+The legacy v1 handoff holds edits, redactions and conflicting observations.
+The v2 all-joined handoff publishes each native edit or redaction under its own
+immutable event ID, including its source-provided target relation. It does not
+replace or hold the target event. A redacted native view retains the bytes still
+available with an explicit native_content_redacted gap. Genuinely conflicting
+observations of the same event remain held. Arrival order, timestamps and receipt
+clocks never establish authority to replace another event.
 [PCP286](https://github.com/Just-Insane/personal-context-platform/issues/286)'s
 authenticated native cause/currentness binding remains an unresolved interface.
 
@@ -267,10 +270,11 @@ Existing acknowledged media is not downloaded or resent during later batches.
 
 Encrypted media is retained as exact ciphertext with a separate decryption gap;
 it is not relabelled as a decoded file. Unsupported external locators, files over
-16 MiB, missing keys, media failures, oversized native responses and unresolved
-edits/redactions remain explicit gaps. Every edit/redaction's raw bytes and target
-are retained as held obligations while the separate parent lifecycle contract is
-resolved. Healthy siblings continue. Page traversal completion is not publication,
+16 MiB, missing keys, media failures, oversized native responses and conflicting
+observations remain explicit gaps. Native edit/redaction events and their target
+relations are published independently, including edits discovered through later
+decryption of already captured ciphertext. They never rewrite their target.
+Healthy siblings continue. Page traversal completion is not publication,
 media, key or lifecycle completion; `coverage()` reports these outstanding work
 counts separately.
 

@@ -142,6 +142,41 @@ test("transport spelling duplicates preserve exact originals and do not duplicat
   for (const item of handoff.obligations()) assert.ok(handoff.original(item.id));
 });
 
+test("immutable edits and redactions stay independently publishable in any arrival order", t => {
+  const { handoff } = fixture(t);
+  handoff.retain(sync("s1", { [ROOM]: [
+    event("$redaction", { redacts: "$edit" }, { type: "m.room.redaction" }),
+    event("$edit", { body: "* replacement", "m.new_content": { body: "replacement" },
+      "m.relates_to": { rel_type: "m.replace", event_id: "$original" } }),
+    event("$original"),
+    event("$already-redacted", {}, { unsigned: { redacted_because: { event_id: "$native-redaction" } } }),
+  ] }), null);
+  const rows = handoff.obligations();
+  assert.ok(rows.every(row => row.state === "ready"));
+  const observations = rows.map(row => JSON.parse(handoff.publication(row.id)!.body).observation);
+  assert.deepEqual(observations.map(o => o.relation), [
+    { kind: "redaction", target_event_id: "$edit" }, { kind: "edit", target_event_id: "$original" },
+    { kind: "original", target_event_id: null }, { kind: "original", target_event_id: null },
+  ]);
+  assert.ok(observations[3].gaps.includes("native_content_redacted"));
+  for (const row of rows) assert.ok(handoff.original(row.id));
+});
+
+test("decrypting an already retained edit enriches that event without holding its original target", async t => {
+  const { handoff } = fixture(t);
+  handoff.retain(sync("s1", { [ROOM]: [event("$original"),
+    event("$edit", { ciphertext: "fixture" }, { type: "m.room.encrypted" })] }), null);
+  const [original, edit] = handoff.obligations(); acknowledge(handoff, edit.id);
+  const available = client({ getEventMapper: () => () => ({ isDecryptionFailure: () => false, getType: () => "m.room.message",
+    isRedacted: () => false, getOriginalContent: () => ({ body: "* changed", "m.new_content": { body: "changed" },
+      "m.relates_to": { rel_type: "m.replace", event_id: "$original" } }) }) });
+  await preparePcpPublication(handoff, edit.id, available, { media: async () => Buffer.alloc(0) }, NOW);
+  assert.equal(handoff.state(original.id), "ready"); assert.equal(handoff.state(edit.id), "ready");
+  const prepared = JSON.parse(handoff.publication(edit.id)!.body).observation;
+  assert.deepEqual(prepared.relation, { kind: "edit", target_event_id: "$original" });
+  assert.equal(prepared.decrypted_event.content["m.new_content"].body, "changed");
+});
+
 test("v2 publisher binds exact room and acquisition headers while keeping compact receipt schema", async t => {
   const { handoff } = fixture(t); handoff.recordJoinedRooms([ROOM]);
   handoff.retainHistory(handoff.historyWork(NOW)!, history([event("$history", undefined, { room_id: ROOM })]));

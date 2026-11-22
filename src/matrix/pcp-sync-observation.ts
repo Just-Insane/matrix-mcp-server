@@ -194,14 +194,17 @@ function prepareObservation(
   const relation = object(content["m.relates_to"]) ? content["m.relates_to"] : {};
   const edit = relation.rel_type === "m.replace";
   const redaction = raw.type === "m.room.redaction";
+  let relationKind = "original";
   if (edit || redaction) {
     const target = edit ? relation.event_id : content.redacts ?? raw.redacts;
     result.targetEventId = text(target, 2048) ? target : null;
-    gaps.push("lifecycle_contract_pending");
-    return result;
+    if (!allJoinedSelection(selection)) { gaps.push("lifecycle_contract_pending"); return result; }
+    relationKind = result.targetEventId ? edit ? "edit" : "redaction" : "unknown";
+    if (!result.targetEventId) gaps.push("native_relation_target_unavailable");
   }
   if (object(raw.unsigned) && raw.unsigned.redacted_because !== undefined) {
-    gaps.push("lifecycle_contract_pending"); return result;
+    if (!allJoinedSelection(selection)) { gaps.push("lifecycle_contract_pending"); return result; }
+    gaps.push("native_content_redacted");
   }
   if (!["m.room.message", "m.room.encrypted"].includes(String(raw.type)) || stream !== "timeline") {
     gaps.push("non_message_observation");
@@ -231,7 +234,7 @@ function prepareObservation(
     observed_at: observedAt, event_time: time, raw: providerRaw,
     decryption: encrypted ? "missing" : "available", coverage: "partial",
     bridge: { status: "none", native_id: null, bridged_id: null },
-    gaps, relation: { kind: "original", target_event_id: null },
+    gaps, relation: { kind: relationKind, target_event_id: result.targetEventId },
     attachments: locators.map(locator => ({ locator, custody: "reference" })),
   };
   if (Buffer.byteLength(JSON.stringify(observation)) > 1_000_000) {

@@ -317,11 +317,11 @@ export class PcpSyncHandoff {
       { id: string; semantic_sha256: string } | undefined : undefined;
     const variant = prior && prior.semantic_sha256 !== semantic;
     const duplicate = prior && prior.id !== id && !variant;
-    const mutation = item.eventId && this.db.prepare(`SELECT 1 FROM pcp_matrix_observations
-      WHERE room_id=? AND target_event_id=? LIMIT 1`).get(item.roomId, item.eventId);
     const gaps = [...new Set([...item.gaps, ...(variant ? ["conflicting_native_observation"] : []),
-      ...(duplicate ? ["duplicate_native_delivery"] : []), ...(mutation ? ["lifecycle_contract_pending"] : [])])];
-    const state: State = item.publication && !variant && !duplicate && !mutation ? "ready" : "held";
+      ...(duplicate ? ["duplicate_native_delivery"] : [])])];
+    // Matrix edits and redactions have their own immutable event IDs. Retain
+    // each event independently; its relation never replaces or holds a sibling.
+    const state: State = item.publication && !variant && !duplicate ? "ready" : "held";
     this.db.prepare(`INSERT OR IGNORE INTO pcp_matrix_observations
       (id,event_id,wire,wire_sha256,publication_json,query_json,query_digest,target_event_id,gaps_json,state,
       room_id,mode,semantic_sha256) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
@@ -338,13 +338,13 @@ export class PcpSyncHandoff {
           .run(JSON.stringify(body), original);
       }
     }
-    if (variant || item.targetEventId) {
-      const target = item.targetEventId ?? item.eventId;
+    if (variant) {
+      const target = item.eventId;
       const rows = this.db.prepare(`SELECT id,gaps_json FROM pcp_matrix_observations
         WHERE room_id=? AND event_id=? AND state='ready'`).all(item.roomId, target) as { id: string; gaps_json: string }[];
       for (const row of rows) this.db.prepare("UPDATE pcp_matrix_observations SET state='held',gaps_json=? WHERE id=?")
         .run(JSON.stringify([...new Set([...JSON.parse(row.gaps_json),
-          item.targetEventId ? "lifecycle_contract_pending" : "conflicting_native_observation"])]), row.id);
+          "conflicting_native_observation"])]), row.id);
     }
     this.db.prepare(`INSERT INTO pcp_matrix_batch_items(batch_id,observation_id,section,stream,ordinal)
       VALUES (?,?,?,?,?)`).run(batchId, id, item.section + ":" + item.roomId, item.stream, item.ordinal);

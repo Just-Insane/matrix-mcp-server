@@ -95,7 +95,8 @@ function mediaInventory(content: any): { locator: string; encrypted: boolean; ex
   return [...result.values()];
 }
 
-/** Use the existing crypto context for original content, never a bundled edit.
+/** Use the existing crypto context for the event's original content, never a
+ * bundled replacement applied to another event.
  * Partial key/media availability leaves a durable retry and the full original
  * independently publishable. Exact ciphertext media is never relabelled clear. */
 export async function preparePcpPublication(handoff: PcpSyncHandoff, id: string, client: AcquisitionClient,
@@ -116,11 +117,7 @@ export async function preparePcpPublication(handoff: PcpSyncHandoff, id: string,
         })]);
         if (event.isDecryptionFailure() || event.getType() === "m.room.encrypted") throw new Error("Existing Matrix key unavailable");
         const clear = JSON.parse(JSON.stringify(event.getOriginalContent()));
-        const relation = clear?.["m.relates_to"];
-        if (relation?.rel_type === "m.replace" || event.getType() === "m.room.redaction" || event.isRedacted()) {
-          handoff.holdDecryptedMutation(id, typeof relation?.event_id === "string" ? relation.event_id : null);
-          return;
-        }
+        if (event.isRedacted()) throw new Error("Native event content was redacted");
         observation.decrypted_event = { room_id: context.room, event_id: observation.event_id, type: event.getType(), content: clear };
       } catch { decryptionMissing = true; }
       finally { if (timeout) clearTimeout(timeout); }
@@ -129,6 +126,13 @@ export async function preparePcpPublication(handoff: PcpSyncHandoff, id: string,
       content = observation.decrypted_event.content;
       observation.decryption = "available";
       const relation = content?.["m.relates_to"];
+      const edit = relation?.rel_type === "m.replace", redaction = observation.decrypted_event.type === "m.room.redaction";
+      if (edit || redaction) {
+        const target = edit ? relation.event_id : content.redacts;
+        const known = typeof target === "string" && target.length > 0 && target.length <= 2048 && !/[\u0000-\u001f\u007f]/.test(target);
+        observation.relation = { kind: known ? edit ? "edit" : "redaction" : "unknown", target_event_id: known ? target : null };
+        if (!known) gaps.add("native_relation_target_unavailable");
+      }
       if (!observation.thread_id && ["m.thread", "io.element.thread"].includes(relation?.rel_type) && typeof relation.event_id === "string") {
         observation.thread_id = relation.event_id;
       }
