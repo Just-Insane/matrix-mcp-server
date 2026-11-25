@@ -78,6 +78,7 @@ export class PcpNativeReader {
     const url = new URL("/_matrix/client/v3/sync", this.handoff.selection.homeserverUrl);
     url.searchParams.set("timeout", "0");
     url.searchParams.set("full_state", "true");
+    url.searchParams.set("set_presence", "offline");
     url.searchParams.set("filter", JSON.stringify(decisionRoomsFilter));
     const [bytes, inventory] = await Promise.all([
       this.bytes(url, MAX_SNAPSHOT_BYTES), this.client.getJoinedRooms(),
