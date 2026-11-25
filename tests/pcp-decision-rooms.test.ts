@@ -9,7 +9,7 @@ function room(name?:string, children?:Array<ReturnType<typeof event>>){
    ...(name===undefined?[]:[event("m.room.name","",{name})]),...children??[]]}};
 }
 function wire(rooms:Record<string,ReturnType<typeof room>>, direct:unknown){
- return {rooms:{join:rooms},account_data:{events:[{type:"m.direct",content:direct}]}};
+ return {next_batch:"opaque",rooms:{join:rooms},account_data:{events:[{type:"m.direct",content:direct}]}};
 }
 
 test("trusted account m.direct and joined-space canonical name only",()=>{
@@ -30,4 +30,15 @@ test("incomplete membership, creation state or account data cannot replace polic
   assert.equal(decisionRoomsSnapshot(wire(rooms,{"@peer:x":"!dm:x"}),Object.keys(rooms)),null);
   assert.deepEqual(decisionRoomsFilter.room.timeline,{limit:0,types:[]});
   assert.deepEqual(decisionRoomsFilter.account_data,{types:["m.direct"]});
+});
+
+test("authoritative zero direct rooms and empty membership clear previous categories",()=>{
+  const rooms={"!space:x":room(undefined,[child("!ann:x")]),"!ann:x":room("Announcements")};
+  assert.deepEqual(decisionRoomsSnapshot({next_batch:"opaque",rooms:{join:rooms},account_data:{events:[]}},Object.keys(rooms),1234),
+    {schema:"matrix-decision-rooms-v1",observed_at:1234,direct:[],announcements:["!ann:x"]});
+  assert.deepEqual(decisionRoomsSnapshot({next_batch:"opaque",rooms:{join:{}}},[],1234),
+    {schema:"matrix-decision-rooms-v1",observed_at:1234,direct:[],announcements:[]});
+  const duplicated={...wire(rooms,{}),account_data:{events:[{type:"m.direct",content:{}},{type:"m.direct",content:{}}]}};
+  assert.equal(decisionRoomsSnapshot(duplicated,Object.keys(rooms)),null);
+  assert.equal(decisionRoomsSnapshot({},[]),null);
 });

@@ -22,21 +22,23 @@ function events(value:unknown):Record<string,any>[]|null{
  * snapshot. Room coverage must agree with the native joined-room inventory.
  * No SDK display name fallbacks, message content or member counts. */
 export function decisionRoomsSnapshot(value:unknown, joined:unknown, now=Date.now()): DecisionRoomsSnapshot|null{
-  if(!object(value)||!object(value.account_data)||!object(value.rooms)||!object(value.rooms.join)
-      ||!Array.isArray(joined)||!joined.length||!joined.every(roomId))return null;
-  const roomIds=Object.keys(value.rooms.join),expected=new Set(joined);
+  if(!object(value)||typeof value.next_batch!=="string"||!value.next_batch||!Array.isArray(joined)||!joined.every(roomId)||
+      value.account_data!==undefined&&!object(value.account_data)||value.rooms!==undefined&&!object(value.rooms))return null;
+  const observedRooms=value.rooms?.join===undefined?{}:value.rooms.join;
+  if(!object(observedRooms))return null;
+  const roomIds=Object.keys(observedRooms),expected=new Set(joined);
   if(expected.size!==roomIds.length||!roomIds.every(id=>expected.has(id)))return null;
-  const accountEvents=events(value.account_data.events);
+  const accountEvents=events(value.account_data?.events===undefined?[]:value.account_data.events);
   const directEvents=accountEvents?.filter(event=>event.type==="m.direct");
-  if(directEvents?.length!==1||!object(directEvents[0].content))return null;
+  if(!directEvents||directEvents.length>1||directEvents.length===1&&!object(directEvents[0].content))return null;
   const direct=new Set<string>(),announcements=new Set<string>();
-  for(const ids of Object.values(directEvents[0].content)){
+  for(const ids of Object.values(directEvents[0]?.content??{})){
     if(!Array.isArray(ids)||!ids.every(roomId))return null;
     for(const id of ids)if(expected.has(id))direct.add(id);
   }
   const rooms=new Map<string,{space:boolean,name:unknown,children:string[]}>();
   for(const id of roomIds){
-    const info=value.rooms.join[id];
+    const info=observedRooms[id];
     if(!object(info)||!object(info.state))return null;
     const state=events(info.state.events);
     if(!state)return null;
