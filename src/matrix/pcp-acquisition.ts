@@ -4,6 +4,7 @@ import type { MatrixClient } from "matrix-js-sdk";
 import { assertNativeSelection, MAX_SYNC_BYTES, MAX_SNAPSHOT_BYTES, type PcpSyncHandoff, type PcpHistoryWork } from "./pcp-sync-handoff.js";
 import { allJoinedSelection, canonicalJson, digest, object, publicationContext, observationItemId } from "./pcp-sync-observation.js";
 import { PcpReceiver, publishPcpObservation } from "./pcp-publication.js";
+import { decisionRoomsFilter, decisionRoomsSnapshot, type DecisionRoomsSnapshot } from "./pcp-decision-rooms.js";
 import { boundedRequestSignal } from "./request-signal.js";
 import { PcpMediaTransfers, decryptedMediaLocator, type MediaInfo, type MediaContext, type PreparedMedia, type MediaOriginal } from "./pcp-media.js";
 
@@ -70,6 +71,19 @@ export class PcpNativeReader {
     // This bounded inventory avoids one huge repeated member list. Separate
     // /state jobs retain the full accessible state, including every member.
     return this.bytes(url, MAX_SNAPSHOT_BYTES);
+  }
+
+  async decisionRooms(): Promise<DecisionRoomsSnapshot|null> {
+    const now = Date.now();
+    const url = new URL("/_matrix/client/v3/sync", this.handoff.selection.homeserverUrl);
+    url.searchParams.set("timeout", "0");
+    url.searchParams.set("full_state", "true");
+    url.searchParams.set("set_presence", "offline");
+    url.searchParams.set("filter", JSON.stringify(decisionRoomsFilter));
+    const [bytes, inventory] = await Promise.all([
+      this.bytes(url, MAX_SNAPSHOT_BYTES), this.client.getJoinedRooms(),
+    ]);
+    return decisionRoomsSnapshot(JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(bytes)),inventory.joined_rooms,now);
   }
 
   async preparedMedia(context: MediaContext, info: MediaInfo, receiver: PcpReceiver): Promise<PreparedMedia> {
@@ -308,10 +322,24 @@ export async function runPcpAcquisitionTick({ client, handoff, receiver, reader,
  * No new host service, cron, SDK client or /sync consumer is introduced. */
 export function startPcpAcquisition(client: AcquisitionClient, handoff: PcpSyncHandoff, receiver: PcpReceiver): () => void {
   const reader = new PcpNativeReader(client, handoff);
-  let stopped = false, running = false;
+  let stopped = false, running = false, refreshing = false, nextPolicyRefresh = 0;
+  const refreshPolicy = async () => {
+    if (stopped || refreshing || Date.now() < nextPolicyRefresh || !allJoinedSelection(handoff.selection)) return;
+    if (client.getSyncState() !== "SYNCING" && client.getSyncState() !== "PREPARED") return;
+    refreshing = true;
+    nextPolicyRefresh = Date.now() + 5*60_000;
+    try {
+      const snapshot = await reader.decisionRooms();
+      if (!snapshot) throw new Error("Room metadata coverage is incomplete");
+      if (!stopped) await receiver.decisionScope(snapshot);
+    }
+    catch { console.error("[pcp-acquisition] Matrix Decisions scope refresh unavailable"); }
+    finally { refreshing = false; }
+  };
   const tick = async () => {
     if (stopped || running) return;
     running = true;
+    void refreshPolicy();
     try {
       const state = client.getSyncState();
       if (state !== null && state !== "ERROR" && state !== "STOPPED") await runPcpAcquisitionTick({

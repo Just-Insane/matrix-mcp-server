@@ -1,4 +1,5 @@
 import fetch from "node-fetch";
+import type { DecisionRoomsSnapshot } from "./pcp-decision-rooms.js";
 import type { Readable } from "node:stream";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
@@ -137,8 +138,8 @@ export class PcpReceiver {
     this.clientSecret = binding.clientSecret;
   }
 
-  private async post(operation: "capture" | "reconcile", body: string, context: { room: string; mode: AcquisitionMode }): Promise<unknown> {
-    if (Buffer.byteLength(body) > (operation === "capture" ? allJoinedSelection(this.selection) ? 24 * 1024 * 1024 : 2_000_000 : 8192)) {
+  private async post(operation: "capture" | "reconcile" | "decision-scope", body: string, context: { room: string; mode: AcquisitionMode }): Promise<unknown> {
+    if (Buffer.byteLength(body) > (operation === "capture" ? allJoinedSelection(this.selection) ? 24 * 1024 * 1024 : 2_000_000 : operation === "decision-scope" ? 512 * 1024 : 8192)) {
       throw new Error("Matrix PCP request exceeds receiver bound");
     }
     const controller = new AbortController();
@@ -177,6 +178,12 @@ export class PcpReceiver {
       }
       return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
     } finally { clearTimeout(timeout); }
+  }
+
+  async decisionScope(snapshot: DecisionRoomsSnapshot): Promise<void> {
+    if (!allJoinedSelection(this.selection)) return;
+    const receipt = await this.post("decision-scope", JSON.stringify(snapshot), {room:"!decisions-snapshot",mode:"live"});
+    if (!object(receipt) || receipt.status !== "accepted") throw new Error("Matrix Decisions scope was not retained");
   }
 
   capture(body: string): Promise<unknown> {
